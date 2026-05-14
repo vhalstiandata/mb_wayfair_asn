@@ -1,0 +1,83 @@
+name: Deploy func1 (Wayfair PO → NetSuite SO)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'func1_po_to_so/**'
+      - 'shared/**'
+      - '.github/workflows/deploy-func1.yml'
+  workflow_dispatch:
+
+env:
+  PROJECT_ID:    ${{ vars.GCP_PROJECT_ID }}
+  REGION:        ${{ vars.GCP_REGION }}
+  SERVICE_NAME:  wayfair-func1-po-to-so
+  REPO:          wayfair-netsuite
+  IMAGE:         wayfair-func1
+  RUNTIME_SA:    ${{ vars.RUNTIME_SERVICE_ACCOUNT }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # required for Workload Identity Federation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account:            ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & push image
+        run: |
+          IMAGE_URI="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE}:${GITHUB_SHA}"
+          IMAGE_URI_LATEST="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/${IMAGE}:latest"
+          docker build -f func1_po_to_so/Dockerfile -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" .
+          docker push "$IMAGE_URI"
+          docker push "$IMAGE_URI_LATEST"
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "$SERVICE_NAME" \
+            --image="$IMAGE_URI" \
+            --region="$REGION" \
+            --platform=managed \
+            --no-allow-unauthenticated \
+            --service-account="$RUNTIME_SA" \
+            --memory=1Gi \
+            --cpu=1 \
+            --timeout=3600 \
+            --max-instances=1 \
+            --concurrency=1 \
+            --set-env-vars="ENVIRONMENT=${{ vars.WF_ENVIRONMENT }}" \
+            --set-env-vars="LOOKBACK_DAYS=3" \
+            --set-env-vars="ONLY_NEW_POS=false" \
+            --set-env-vars="CLIENT_SIDE_DATE_FILTER=true" \
+            --set-env-vars="DRY_RUN=false" \
+            --set-env-vars="BQ_PROJECT_ID=${{ vars.BQ_PROJECT_ID }}" \
+            --set-env-vars="BQ_DATASET=${{ vars.BQ_DATASET }}" \
+            --set-secrets="NETSUITE_REALM=netsuite-realm:latest" \
+            --set-secrets="NETSUITE_CONSUMER_KEY=netsuite-consumer-key:latest" \
+            --set-secrets="NETSUITE_CONSUMER_SECRET=netsuite-consumer-secret:latest" \
+            --set-secrets="NETSUITE_TOKEN=netsuite-token:latest" \
+            --set-secrets="NETSUITE_TOKEN_SECRET=netsuite-token-secret:latest" \
+            --set-secrets="WAYFAIR_CLIENT_ID=wayfair-client-id:latest" \
+            --set-secrets="WAYFAIR_CLIENT_SECRET=wayfair-client-secret:latest"
+
+      - name: Show service URL
+        run: |
+          URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --format='value(status.url)')
+          echo "Service URL: $URL"
