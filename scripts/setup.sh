@@ -27,8 +27,8 @@ set -euo pipefail
 # ============================================================================
 PROJECT_ID="maestrobath"
 REGION="us-central1"
-GITHUB_OWNER="YOUR_GITHUB_USERNAME_OR_ORG"
-GITHUB_REPO="wayfair-netsuite"               # repo name (no owner prefix)
+GITHUB_OWNER="vhalstiandata"
+GITHUB_REPO="mb_wayfair_asn"               # repo name (no owner prefix)
 
 # Names (you usually don't need to change)
 AR_REPO="wayfair-netsuite"                   # Artifact Registry repo
