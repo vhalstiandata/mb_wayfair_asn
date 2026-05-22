@@ -1,17 +1,23 @@
 """
-Cloud Run service: Wayfair PO → NetSuite SO.
+Cloud Run service: Wayfair PO → NetSuite SO → Register → Labels → Email.
 
-Endpoint:
-    POST /  →  runs the pipeline once
+Per PO flow:
+  1. Pull dropship POs from Wayfair (last LOOKBACK_DAYS)
+  2. For each PO not yet in BQ log:
+       - Resolve SKUs + serials in NetSuite
+       - Accept line items in Wayfair
+       - Create Sales Order in NetSuite
+       - Register shipment in Wayfair (gets tracking + label)
+       - Download shipping label + packing slip PDFs
+       - Email warehouse with PDFs attached
+  3. Log result to BQ (wayfair_so_log + wayfair_reg_log)
 
-Returns JSON summary: { "status": "ok", "summary": {...}, "duration_s": N }
-HTTP 200 even on partial failures (Cloud Scheduler will not retry indefinitely);
-detailed status per-PO lives in BigQuery (wayfair_so_log).
+ASN (shipment confirmation) is handled by func2 once Item Fulfillment exists.
 """
 
 import json
-import sys
 import os
+import sys
 import time as time_mod
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -19,16 +25,95 @@ from datetime import datetime, timedelta, timezone
 import flask
 import pandas as pd
 
-# Make shared/ importable when running from inside this folder
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from shared import config as cfg
 from shared import netsuite as ns
 from shared import wayfair  as wf
 from shared import bigquery_log as bqlog
+from shared import email_notify as email
 
 
 app = flask.Flask(__name__)
+
+
+# ==============================================================================
+# REGISTER + LABELS + EMAIL (post-SO)
+# ==============================================================================
+def post_so_actions(wayfair_po, so_number, accepted_items, wf_token, bq):
+    """
+    After SO is created, register the shipment with Wayfair,
+    download the label + packing slip, and email the warehouse.
+
+    Idempotent via wayfair_reg_log — if PO already registered, returns early.
+    All errors are non-fatal: SO is already created, this is enrichment.
+    """
+    existing = bqlog.registration_already_done(bq, wayfair_po)
+    if existing:
+        print(f"  Register: already done (event={existing.get('register_event_id')})")
+        return existing
+
+    # ----- Register -----
+    print(f"  Register: calling mutation...")
+    try:
+        reg = wf.register_shipment(wf_token, wayfair_po)
+        print(f"    Registered: event={reg.get('id')} "
+              f"tracking={reg.get('trackingNumber')} carrier={reg.get('carrierCode')}")
+    except Exception as e:
+        print(f"    Register FAILED (non-fatal): {e}")
+        bqlog.write_reg_log(bq, {
+            "logged_at": datetime.utcnow().isoformat(),
+            "so_number": so_number, "wayfair_po": wayfair_po,
+            "register_event_id": None, "pickup_date": None,
+            "tracking_number": None, "carrier_code": None, "label_path": None,
+            "status": "FAILED", "error_message": str(e)[:1000],
+            "environment": cfg.ENVIRONMENT,
+        })
+        return None
+
+    # ----- Download labels (non-fatal) -----
+    label_path = None
+    packing_path = None
+    try:
+        label_path = wf.download_shipping_label(wf_token, wayfair_po)
+    except Exception as e:
+        print(f"    Label download failed (non-fatal): {e}")
+
+    try:
+        packing_path = wf.download_packing_slip(wf_token, wayfair_po)
+    except Exception as e:
+        print(f"    Packing slip download failed (non-fatal): {e}")
+
+    reg_info = {
+        "register_event_id": str(reg.get("id")) if reg.get("id") else None,
+        "tracking_number":   reg.get("trackingNumber"),
+        "carrier_code":      reg.get("carrierCode"),
+        "label_path":        label_path,
+        "packing_path":      packing_path,
+    }
+
+    bqlog.write_reg_log(bq, {
+        "logged_at": datetime.utcnow().isoformat(),
+        "so_number": so_number, "wayfair_po": wayfair_po,
+        "register_event_id": reg_info["register_event_id"],
+        "pickup_date": reg.get("pickupDate"),
+        "tracking_number": reg_info["tracking_number"],
+        "carrier_code": reg_info["carrier_code"],
+        "label_path": label_path,
+        "status": "SUCCESS", "error_message": None,
+        "environment": cfg.ENVIRONMENT,
+    })
+
+    # ----- Email (non-fatal) -----
+    try:
+        email.send_so_email(
+            wayfair_po, so_number, accepted_items, reg_info,
+            label_path=label_path, packing_path=packing_path,
+        )
+    except Exception as e:
+        print(f"    Email failed (non-fatal): {e}")
+
+    return reg_info
 
 
 # ==============================================================================
@@ -41,7 +126,7 @@ def process_po(po, wf_token, sku_map, bq):
     print(f"\n=== PO {po_number} ===")
 
     if bqlog.so_already_processed(bq, po_number):
-        print(f"  ⏭ Already in log as SUCCESS — SKIP")
+        print(f"  Already in log as SUCCESS — SKIP")
         return "SKIPPED_ALREADY_DONE", None
 
     accepted_items = []
@@ -55,20 +140,20 @@ def process_po(po, wf_token, sku_map, bq):
         match = sku_map[sku_map["wayfair_sku"] == wf_sku]
         if match.empty:
             unmapped.append(wf_sku)
-            print(f"  × Unmapped: {wf_sku}")
+            print(f"  Unmapped: {wf_sku}")
             continue
         oracle_sku = match.iloc[0]["oracle_sku"]
 
         item_id = ns.get_item_internal_id(oracle_sku)
         if not item_id:
-            unmapped.append(f"{wf_sku} → {oracle_sku}")
-            print(f"  × Oracle SKU not in NS: {oracle_sku}")
+            unmapped.append(f"{wf_sku} -> {oracle_sku}")
+            print(f"  Oracle SKU not in NS: {oracle_sku}")
             continue
 
         serials = ns.get_serials(item_id, qty)
         if not serials:
             short_stock.append(oracle_sku)
-            print(f"  × No serials for {oracle_sku} (need {qty})")
+            print(f"  No serials for {oracle_sku} (need {qty})")
             continue
 
         accepted_items.append({
@@ -82,37 +167,46 @@ def process_po(po, wf_token, sku_map, bq):
         })
 
     if not accepted_items:
-        print(f"  ⚠ No fulfillable items — SKIP")
+        print(f"  No fulfillable items — SKIP")
         return "SKIPPED_NO_STOCK", {"unmapped": unmapped, "short_stock": short_stock}
 
     if short_stock or unmapped:
-        print(f"  ⚠ Partial — unmapped={unmapped}, short={short_stock} — SKIP")
+        print(f"  Partial — unmapped={unmapped}, short={short_stock} — SKIP")
         return "SKIPPED_PARTIAL", {"unmapped": unmapped, "short_stock": short_stock}
 
-    print(f"  → Accepting {len(accepted_items)} line(s) in Wayfair...")
+    # Accept in Wayfair
+    print(f"  Accepting {len(accepted_items)} line(s) in Wayfair...")
     wf_accept_id = wf.acknowledge_po(wf_token, po_number, accepted_items)
-    print(f"  ✓ Wayfair Accept ID: {wf_accept_id}")
+    print(f"  Wayfair Accept ID: {wf_accept_id}")
 
-    print(f"  → Creating SO in NetSuite...")
+    # Create SO in NetSuite
+    print(f"  Creating SO in NetSuite...")
     so_number, so_internal_id = ns.create_sales_order(po_number, accepted_items, po_date)
     if not so_number:
         raise RuntimeError("SO creation returned no tranid")
-    print(f"  ✓ SO Created: {so_number} (internal id {so_internal_id})")
+    print(f"  SO Created: {so_number} (internal id {so_internal_id})")
+
+    # ⭐ NEW: register + labels + email
+    reg_info = post_so_actions(po_number, so_number, accepted_items, wf_token, bq)
 
     return "SUCCESS", {
         "wf_accept_id":   wf_accept_id,
         "so_number":      so_number,
         "so_internal_id": so_internal_id,
         "item_count":     len(accepted_items),
+        "registered":     bool(reg_info),
     }
 
 
 def run_pipeline():
     start = time_mod.time()
-    print(f"=== FUNC1: WAYFAIR PO → NS SO   env={cfg.ENVIRONMENT}   dry={cfg.DRY_RUN} ===")
+    print(f"=== FUNC1: WAYFAIR PO -> NS SO -> REGISTER -> LABELS -> EMAIL   "
+          f"env={cfg.ENVIRONMENT}  dry={cfg.DRY_RUN}  "
+          f"pickup_offset_days={cfg.PICKUP_OFFSET_DAYS} ===")
 
     bq = bqlog.get_bq_client()
     bqlog.ensure_so_log_table(bq)
+    bqlog.ensure_reg_log_table(bq)
 
     raw_inv  = ns.fetch_inventory()
     wf_table = ns.build_wf_inventory_table(raw_inv)
@@ -127,7 +221,6 @@ def run_pipeline():
     open_pos = wf.get_open_orders(wf_token, from_iso, only_new=cfg.ONLY_NEW_POS)
     print(f"Fetched {len(open_pos)} PO(s) from Wayfair (only_new={cfg.ONLY_NEW_POS})")
 
-    # Client-side date filter (Wayfair sandbox sometimes ignores fromDate)
     if cfg.CLIENT_SIDE_DATE_FILTER and open_pos:
         cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.LOOKBACK_DAYS)
         kept = []
@@ -171,7 +264,7 @@ def run_pipeline():
         except Exception as e:
             summary["FAILED"] += 1
             pos_processed.append({"po": po_number, "status": "FAILED", "error": str(e)[:200]})
-            print(f"  × ERROR processing {po_number}: {e}")
+            print(f"  ERROR: {po_number}: {e}")
             traceback.print_exc()
             bqlog.write_so_log(bq, {
                 "logged_at":      datetime.utcnow().isoformat(),
@@ -185,7 +278,7 @@ def run_pipeline():
             })
 
     duration = round(time_mod.time() - start, 2)
-    print(f"\n=== SUMMARY ({duration}s) ===  {summary}")
+    print(f"\n=== SUMMARY ({duration}s) === {summary}")
     return {"status": "ok", "summary": summary, "duration_s": duration,
             "processed": pos_processed}
 
@@ -199,7 +292,7 @@ def handler():
         result = run_pipeline()
         return flask.jsonify(result), 200
     except Exception as e:
-        print(f"× FATAL: {e}")
+        print(f"FATAL: {e}")
         traceback.print_exc()
         return flask.jsonify({"status": "error", "error": str(e)[:500]}), 500
 

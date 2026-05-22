@@ -1,4 +1,4 @@
-"""Lightweight HTTP helper using stdlib urllib."""
+"""Lightweight HTTP helpers using stdlib urllib."""
 
 import json
 import urllib.request
@@ -23,3 +23,14 @@ def urllib_post(url: str, data: dict, headers: dict, timeout: int = 30):
             return e.code, json.loads(body)
         except Exception:
             return e.code, {"error": body}
+
+
+def urllib_get_binary(url: str, headers: dict, timeout: int = 30):
+    """GET and return (status_code, content_type, raw_bytes)."""
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.headers.get("Content-Type", ""), resp.read()
+    except urllib.error.HTTPError as e:
+        body = e.read()
+        return e.code, "", body

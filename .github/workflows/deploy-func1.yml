@@ -1,4 +1,4 @@
-name: Deploy func1 (Wayfair PO → NetSuite SO)
+name: Deploy func1 (Wayfair PO → NetSuite SO + Register + Labels + Email)
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write   # required for Workload Identity Federation
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -67,15 +67,22 @@ jobs:
             --set-env-vars="ONLY_NEW_POS=false" \
             --set-env-vars="CLIENT_SIDE_DATE_FILTER=true" \
             --set-env-vars="DRY_RUN=false" \
+            --set-env-vars="PICKUP_OFFSET_DAYS=${{ vars.PICKUP_OFFSET_DAYS }}" \
             --set-env-vars="BQ_PROJECT_ID=${{ vars.BQ_PROJECT_ID }}" \
             --set-env-vars="BQ_DATASET=${{ vars.BQ_DATASET }}" \
+            --set-env-vars="WAYFAIR_WAREHOUSE_ID=${{ vars.WAYFAIR_WAREHOUSE_ID }}" \
+            --set-env-vars="EMAIL_ENABLED=true" \
+            --set-env-vars="EMAIL_ADDR=sale@maestrobath.com" \
+            --set-env-vars="EMAIL_TO=sale@maestrobath.com" \
+            --set-env-vars="EMAIL_CC=johnny@maestrobath.com,fernando@maestrobath.com,mehdi@maestrobath.com" \
             --set-secrets="NETSUITE_REALM=netsuite-realm:latest" \
             --set-secrets="NETSUITE_CONSUMER_KEY=netsuite-consumer-key:latest" \
             --set-secrets="NETSUITE_CONSUMER_SECRET=netsuite-consumer-secret:latest" \
             --set-secrets="NETSUITE_TOKEN=netsuite-token:latest" \
             --set-secrets="NETSUITE_TOKEN_SECRET=netsuite-token-secret:latest" \
             --set-secrets="WAYFAIR_CLIENT_ID=wayfair-client-id:latest" \
-            --set-secrets="WAYFAIR_CLIENT_SECRET=wayfair-client-secret:latest"
+            --set-secrets="WAYFAIR_CLIENT_SECRET=wayfair-client-secret:latest" \
+            --set-secrets="EMAIL_APP_PASSWORD=email-app-password:latest"
 
       - name: Show service URL
         run: |

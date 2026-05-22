@@ -9,9 +9,6 @@ from shared import config as cfg
 # ==============================================================================
 # CLIENT
 # ==============================================================================
-# Scopes required for BQ + external tables that read from Google Drive/Sheets.
-# Cloud Run's default token only has cloud-platform scope — without drive scope,
-# BQ refuses to query external Sheets tables.
 _BQ_SCOPES = [
     "https://www.googleapis.com/auth/bigquery",
     "https://www.googleapis.com/auth/cloud-platform",
@@ -20,12 +17,7 @@ _BQ_SCOPES = [
 ]
 
 
-def get_bq_client() -> bigquery.Client:
-    """
-    Uses Application Default Credentials (ADC) with explicit Drive scope so
-    BigQuery external tables backed by Google Sheets work.
-    On Cloud Run uses the runtime service account.
-    """
+def get_bq_client():
     credentials, project = google.auth.default(scopes=_BQ_SCOPES)
     return bigquery.Client(project=cfg.BQ_PROJECT_ID, credentials=credentials)
 
@@ -59,11 +51,25 @@ ASN_LOG_SCHEMA = [
     bigquery.SchemaField("environment",         "STRING",    mode="NULLABLE"),
 ]
 
+REG_LOG_SCHEMA = [
+    bigquery.SchemaField("logged_at",           "TIMESTAMP", mode="REQUIRED"),
+    bigquery.SchemaField("so_number",           "STRING",    mode="REQUIRED"),
+    bigquery.SchemaField("wayfair_po",          "STRING",    mode="REQUIRED"),
+    bigquery.SchemaField("register_event_id",   "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("pickup_date",         "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("tracking_number",     "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("carrier_code",        "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("label_path",          "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("status",              "STRING",    mode="REQUIRED"),
+    bigquery.SchemaField("error_message",       "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("environment",         "STRING",    mode="NULLABLE"),
+]
+
 
 # ==============================================================================
 # ENSURE TABLES
 # ==============================================================================
-def ensure_table(bq: bigquery.Client, table_id: str, schema):
+def ensure_table(bq, table_id, schema):
     try:
         bq.get_table(table_id)
     except Exception:
@@ -71,14 +77,15 @@ def ensure_table(bq: bigquery.Client, table_id: str, schema):
         print(f"Created log table: {table_id}")
 
 
-def ensure_so_log_table(bq):  ensure_table(bq, cfg.BQ_SO_LOG_TABLE,  SO_LOG_SCHEMA)
-def ensure_asn_log_table(bq): ensure_table(bq, cfg.BQ_ASN_LOG_TABLE, ASN_LOG_SCHEMA)
+def ensure_so_log_table(bq):   ensure_table(bq, cfg.BQ_SO_LOG_TABLE,  SO_LOG_SCHEMA)
+def ensure_asn_log_table(bq):  ensure_table(bq, cfg.BQ_ASN_LOG_TABLE, ASN_LOG_SCHEMA)
+def ensure_reg_log_table(bq):  ensure_table(bq, cfg.BQ_REG_LOG_TABLE, REG_LOG_SCHEMA)
 
 
 # ==============================================================================
 # SO LOG: dedup + load pending
 # ==============================================================================
-def so_already_processed(bq: bigquery.Client, po_number: str) -> bool:
+def so_already_processed(bq, po_number):
     q = f"""
         SELECT COUNT(*) AS c
         FROM `{cfg.BQ_SO_LOG_TABLE}`
@@ -90,7 +97,7 @@ def so_already_processed(bq: bigquery.Client, po_number: str) -> bool:
     return list(job.result())[0].c > 0
 
 
-def get_recent_successful_sos(bq: bigquery.Client, lookback_days: int):
+def get_recent_successful_sos(bq, lookback_days):
     q = f"""
         SELECT wayfair_po, so_number, so_internal_id, po_date
         FROM `{cfg.BQ_SO_LOG_TABLE}`
@@ -107,7 +114,7 @@ def get_recent_successful_sos(bq: bigquery.Client, lookback_days: int):
 # ==============================================================================
 # ASN LOG: dedup
 # ==============================================================================
-def asn_already_sent(bq: bigquery.Client, so_number: str, tracking: str) -> bool:
+def asn_already_sent(bq, so_number, tracking):
     q = f"""
         SELECT COUNT(*) AS c
         FROM `{cfg.BQ_ASN_LOG_TABLE}`
@@ -125,22 +132,44 @@ def asn_already_sent(bq: bigquery.Client, so_number: str, tracking: str) -> bool
 
 
 # ==============================================================================
+# REG LOG: dedup
+# ==============================================================================
+def registration_already_done(bq, wayfair_po):
+    """Check if PO was already registered. Returns row dict or None."""
+    q = f"""
+        SELECT register_event_id, tracking_number, carrier_code, label_path
+        FROM `{cfg.BQ_REG_LOG_TABLE}`
+        WHERE wayfair_po = @po AND status = 'SUCCESS'
+        ORDER BY logged_at DESC
+        LIMIT 1
+    """
+    job = bq.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("po", "STRING", wayfair_po)]
+    ))
+    rows = list(job.result())
+    if rows:
+        return dict(rows[0])
+    return None
+
+
+# ==============================================================================
 # WRITE
 # ==============================================================================
-def write_row(bq: bigquery.Client, table_id: str, row: dict):
+def write_row(bq, table_id, row):
     errors = bq.insert_rows_json(table_id, [row])
     if errors:
-        print(f"⚠ BQ insert errors for {table_id}: {errors}")
+        print(f"  BQ insert errors for {table_id}: {errors}")
 
 
-def write_so_log(bq, row):  write_row(bq, cfg.BQ_SO_LOG_TABLE,  row)
-def write_asn_log(bq, row): write_row(bq, cfg.BQ_ASN_LOG_TABLE, row)
+def write_so_log(bq, row):   write_row(bq, cfg.BQ_SO_LOG_TABLE,  row)
+def write_asn_log(bq, row):  write_row(bq, cfg.BQ_ASN_LOG_TABLE, row)
+def write_reg_log(bq, row):  write_row(bq, cfg.BQ_REG_LOG_TABLE, row)
 
 
 # ==============================================================================
 # SKU MAP
 # ==============================================================================
-def get_sku_map(bq: bigquery.Client):
+def get_sku_map(bq):
     return bq.query(
         f"SELECT TRIM(sku) AS oracle_sku, TRIM(wayfair_sku) AS wayfair_sku "
         f"FROM `{cfg.BQ_SKU_MAP_TABLE}` WHERE wayfair_sku IS NOT NULL"

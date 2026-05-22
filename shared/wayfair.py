@@ -1,11 +1,12 @@
-"""Wayfair GraphQL API: token, get orders, accept, send ASN."""
+"""Wayfair GraphQL API: token, get orders, accept, register, labels, send ASN."""
 
+import os
 import time
 import re
 from datetime import datetime, timedelta
 
 from shared import config as cfg
-from shared.http_helpers import urllib_post
+from shared.http_helpers import urllib_post, urllib_get_binary
 
 
 # ==============================================================================
@@ -32,7 +33,6 @@ def get_wf_token() -> str:
 # DROPSHIP PURCHASE ORDERS
 # ==============================================================================
 def get_open_orders(wf_token: str, from_date_iso: str, only_new: bool):
-    """Fetch dropship POs. If only_new=True → hasResponse:false (un-accepted only)."""
     if only_new:
         query = """
         query GetOpenPOs($fromDate: IsoDateTime, $limit: Int32) {
@@ -69,7 +69,6 @@ def get_open_orders(wf_token: str, from_date_iso: str, only_new: bool):
 
 
 def get_po_data(wf_token: str, po_number: str) -> dict:
-    """Fetch shipTo + products for a single PO."""
     query = """
     query GetPOs($poNumbers: [String!]!) {
       getDropshipPurchaseOrders(poNumbers: $poNumbers) {
@@ -97,13 +96,12 @@ def get_po_data(wf_token: str, po_number: str) -> dict:
 # ACCEPT
 # ==============================================================================
 def acknowledge_po(wf_token: str, po_number: str, accepted_items: list):
-    """Accept line items in Wayfair. Returns the accept-mutation id."""
     line_items = [
         {
             "partNumber":        i["wayfair_sku"],
             "quantity":          int(i["ordered_qty"]),
             "unitPrice":         float(i.get("wayfair_price") or 0),
-            "estimatedShipDate": (datetime.utcnow() + timedelta(days=2)).strftime("%Y-%m-%dT00:00:00Z"),
+            "estimatedShipDate": (datetime.utcnow() + timedelta(days=cfg.PICKUP_OFFSET_DAYS)).strftime("%Y-%m-%dT00:00:00Z"),
         }
         for i in accepted_items
     ]
@@ -126,10 +124,138 @@ def acknowledge_po(wf_token: str, po_number: str, accepted_items: list):
 
 
 # ==============================================================================
+# REGISTER SHIPMENT
+# ==============================================================================
+def register_shipment(wf_token, po_number, warehouse_id=None, pickup_date=None):
+    """
+    Register shipment with Wayfair (required before labels/ASN).
+    pickup_date defaults to UTC midnight + PICKUP_OFFSET_DAYS (env-controlled, 2..5).
+    """
+    if cfg.DRY_RUN:
+        return {"id": "DRY_RUN", "poNumber": po_number}
+
+    warehouse_id = warehouse_id or cfg.WAYFAIR_WAREHOUSE_ID
+    if not pickup_date:
+        pickup_dt = datetime.utcnow() + timedelta(days=cfg.PICKUP_OFFSET_DAYS)
+        # 17:00 UTC = 09:00 LA (PST) / 10:00 LA (PDT) — realistic morning pickup window
+        pickup_date = pickup_dt.replace(hour=17, minute=0, second=0, microsecond=0).strftime(
+            "%Y-%m-%d %H:%M:%S.000000 +00:00"
+        )
+
+    query = """
+    mutation register($registrationInput: RegistrationInput!) {
+        purchaseOrders {
+            register(registrationInput: $registrationInput) {
+                id poNumber pickupDate eventDate
+                consolidatedShippingLabel { url }
+                billOfLading { url }
+                purchaseOrder { packingSlipUrl }
+                generatedShippingLabels {
+                    poNumber carrier carrierCode trackingNumber
+                }
+                customsDocument { required url }
+            }
+        }
+    }
+    """
+    params = {
+        "poNumber": po_number,
+        "warehouseId": warehouse_id,
+        "requestForPickupDate": pickup_date,
+    }
+    status, data = urllib_post(
+        cfg.WAYFAIR_GQL_URL,
+        {"query": query, "variables": {"registrationInput": params}},
+        {"Authorization": f"Bearer {wf_token}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    if status != 200 or "errors" in data:
+        raise RuntimeError(
+            f"Register failed for {po_number}: HTTP {status} - {data.get('errors', data)}"
+        )
+
+    reg = data.get("data", {}).get("purchaseOrders", {}).get("register", {})
+
+    result = {
+        "id":         reg.get("id"),
+        "poNumber":   reg.get("poNumber"),
+        "pickupDate": reg.get("pickupDate"),
+        "eventDate":  reg.get("eventDate"),
+    }
+
+    labels = reg.get("generatedShippingLabels") or []
+    if labels:
+        first = labels[0]
+        result["trackingNumber"] = first.get("trackingNumber")
+        result["carrierCode"]    = first.get("carrierCode")
+        result["carrier"]        = first.get("carrier")
+    else:
+        result["trackingNumber"] = None
+        result["carrierCode"]    = None
+
+    csl = reg.get("consolidatedShippingLabel") or {}
+    result["shippingLabelUrl"] = csl.get("url")
+    bol = reg.get("billOfLading") or {}
+    result["bolUrl"] = bol.get("url")
+    po_info = reg.get("purchaseOrder") or {}
+    result["packingSlipUrl"] = po_info.get("packingSlipUrl")
+
+    return result
+
+
+# ==============================================================================
+# DOWNLOAD SHIPPING DOCUMENTS (REST) — with content-type validation
+# ==============================================================================
+def _save_binary(po_number, body, content_type, save_dir, suffix, allowed_exts):
+    ct = (content_type or "").lower()
+    if not any(x in ct for x in allowed_exts):
+        print(f"    {suffix} skipped: unexpected content-type '{content_type}'")
+        return None
+    if len(body) < 500:
+        print(f"    {suffix} skipped: payload too small ({len(body)} bytes)")
+        return None
+    os.makedirs(save_dir, exist_ok=True)
+    ext = "zpl" if "zpl" in ct else "pdf"
+    path = os.path.join(save_dir, f"{po_number}_{suffix}.{ext}")
+    with open(path, "wb") as f:
+        f.write(body)
+    print(f"    {suffix} saved: {path} ({len(body):,} bytes)")
+    return path
+
+
+def download_shipping_label(wf_token, po_number, save_dir=None):
+    save_dir = save_dir or cfg.LABEL_DOWNLOAD_DIR
+    url = f"{cfg.WAYFAIR_REST_BASE}/shipping_label/{po_number}"
+    status, content_type, body = urllib_get_binary(
+        url,
+        {"Authorization": f"Bearer {wf_token}", "Accept": "application/pdf"},
+        timeout=30,
+    )
+    if status != 200:
+        print(f"    Label download failed: HTTP {status}")
+        return None
+    return _save_binary(po_number, body, content_type, save_dir, "label",
+                         ("pdf", "zpl", "octet-stream"))
+
+
+def download_packing_slip(wf_token, po_number, save_dir=None):
+    save_dir = save_dir or cfg.LABEL_DOWNLOAD_DIR
+    url = f"{cfg.WAYFAIR_REST_BASE}/packing_slip/{po_number}"
+    status, content_type, body = urllib_get_binary(
+        url,
+        {"Authorization": f"Bearer {wf_token}", "Accept": "application/pdf"},
+        timeout=30,
+    )
+    if status != 200:
+        return None
+    return _save_binary(po_number, body, content_type, save_dir, "packing_slip",
+                         ("pdf", "octet-stream"))
+
+
+# ==============================================================================
 # SHIP NOTICE (ASN)
 # ==============================================================================
-def detect_carrier_from_tracking(t: str):
-    """Best-effort carrier detection from a tracking number's format."""
+def detect_carrier_from_tracking(t):
     if not t:
         return None
     t = re.sub(r"\s+", "", str(t)).upper()
@@ -146,9 +272,7 @@ def detect_carrier_from_tracking(t: str):
     return None
 
 
-def send_asn(wf_token: str, po_number: str, tracking: str, carrier: str,
-             products: list, ship_to: dict) -> dict:
-    """Send a shipment notification (ASN) to Wayfair."""
+def send_asn(wf_token, po_number, tracking, carrier, products, ship_to):
     if cfg.DRY_RUN:
         return {"id": "DRY_RUN", "status": "DRY_RUN"}
 
@@ -192,5 +316,5 @@ def send_asn(wf_token: str, po_number: str, tracking: str, carrier: str,
         timeout=30,
     )
     if status != 200 or "errors" in data:
-        raise RuntimeError(f"Shipment failed: HTTP {status} — {data.get('errors', data)}")
+        raise RuntimeError(f"Shipment failed: HTTP {status} - {data.get('errors', data)}")
     return data.get("data", {}).get("purchaseOrders", {}).get("shipment", {})
