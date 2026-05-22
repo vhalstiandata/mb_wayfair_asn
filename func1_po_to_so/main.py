@@ -150,11 +150,16 @@ def process_po(po, wf_token, sku_map, bq):
             print(f"  Oracle SKU not in NS: {oracle_sku}")
             continue
 
-        serials = ns.get_serials(item_id, qty)
-        if not serials:
+        serials_allocations = ns.allocate_serials_multi_location(item_id, qty)
+        if not serials_allocations:
             short_stock.append(oracle_sku)
             print(f"  No serials for {oracle_sku} (need {qty})")
             continue
+
+        if len(serials_allocations) > 1:
+            split_summary = ", ".join(f"loc {a['location']}: {len(a['serials'])}"
+                                       for a in serials_allocations)
+            print(f"  {oracle_sku}: split across locations ({split_summary})")
 
         accepted_items.append({
             "wayfair_sku":   wf_sku,
@@ -163,7 +168,7 @@ def process_po(po, wf_token, sku_map, bq):
             "ordered_qty":   qty,
             "wayfair_price": price,
             "retail_price":  ns.get_item_retail_price(item_id),
-            "serials":       serials,
+            "allocations":   serials_allocations,
         })
 
     if not accepted_items:
