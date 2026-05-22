@@ -74,7 +74,7 @@ jobs:
             --set-env-vars="EMAIL_ENABLED=true" \
             --set-env-vars="EMAIL_ADDR=sale@maestrobath.com" \
             --set-env-vars="EMAIL_TO=sale@maestrobath.com" \
-            --set-env-vars="EMAIL_CC=johnny@maestrobath.com,fernando@maestrobath.com,mehdi@maestrobath.com,data@maestrobath.com" \
+            --set-env-vars="^|^EMAIL_CC=johnny@maestrobath.com,fernando@maestrobath.com,mehdi@maestrobath.com,data@maestrobath.com" \
             --set-secrets="NETSUITE_REALM=netsuite-realm:latest" \
             --set-secrets="NETSUITE_CONSUMER_KEY=netsuite-consumer-key:latest" \
             --set-secrets="NETSUITE_CONSUMER_SECRET=netsuite-consumer-secret:latest" \
