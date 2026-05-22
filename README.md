@@ -1,154 +1,286 @@
 # Wayfair ↔ NetSuite Integration
 
-Two Cloud Run services that automate dropship order fulfillment between Wayfair and NetSuite:
-
-| Service | Schedule | What it does |
-|---|---|---|
-| **func1** `wayfair-func1-po-to-so` | every 10 min | Pulls new dropship POs from Wayfair → accepts line items → creates Sales Orders in NetSuite (with serial numbers + line-level discount) |
-| **func2** `wayfair-func2-if-to-asn` | every 15 min | For each SO created by func1, checks if an Item Fulfillment exists in NetSuite → forwards tracking number to Wayfair as an ASN |
-
-Both functions log every action to BigQuery (`wayfair_so_log`, `wayfair_asn_log`) and use those logs for deduplication.
+Two Cloud Run services that automate dropship order fulfillment between Wayfair and NetSuite.
 
 ## Architecture
 
 ```
-                ┌─────────────────┐
-                │ Cloud Scheduler │  (cron)
-                └────────┬────────┘
-                         │ OIDC-authenticated POST
-       ┌─────────────────┴─────────────────┐
-       ▼                                   ▼
-┌──────────────┐                    ┌──────────────┐
-│  Cloud Run   │                    │  Cloud Run   │
-│   func1      │                    │   func2      │
-│ PO → SO      │                    │ IF → ASN     │
-└──────┬───────┘                    └──────┬───────┘
-       │                                   │
-       │  ┌─────────────┐  ┌─────────────┐ │
-       └─→│  NetSuite   │  │   Wayfair   │←┘
-          │ REST/Restlet│  │   GraphQL   │
-          └─────────────┘  └─────────────┘
-       │                                   │
-       └──────────┬──────────────┬─────────┘
-                  ▼              ▼
-            ┌─────────────────────────┐
-            │       BigQuery          │
-            │  wayfair_so_log         │
-            │  wayfair_asn_log        │
-            │  wayfair_sku_mapper     │
-            └─────────────────────────┘
+                      ┌─────────────────────────────┐
+                      │   WAYFAIR (sandbox/prod)    │
+                      └──────────┬──────────────────┘
+                                 │ PO arrives
+                                 ▼
+              ┌──────────────────────────────────────┐
+              │  Cloud Scheduler triggers every 10m  │
+              └──────────────┬───────────────────────┘
+                             ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  func1 — wayfair-func1-po-to-so                              │
+   │                                                              │
+   │  1. Pull POs from Wayfair (last 3 days)                      │
+   │  2. For each PO not yet in wayfair_so_log:                   │
+   │     a. SKU map check (BQ external Sheets)                    │
+   │     b. Serials lookup (NS SuiteQL)                           │
+   │     c. Accept in Wayfair                                     │
+   │     d. Create SO in NetSuite (with discount line)            │
+   │     e. Register shipment in Wayfair                          │
+   │        → returns tracking + carrier (Wayfair-assigned)       │
+   │     f. Download shipping label PDF                           │
+   │     g. Download packing slip PDF                             │
+   │     h. Email warehouse with PDFs                             │
+   │  3. Log to BQ                                                │
+   └──────┬───────────────┬───────────────────────────────┬───────┘
+          │ SO created    │ Registration done       Email sent
+          ▼               ▼                                ▼
+   ┌─────────┐    ┌──────────────┐              ┌──────────────────┐
+   │  BQ     │    │   BQ         │              │ sale@maestrobath │
+   │ so_log  │    │  reg_log     │              │ + 4 cc           │
+   └────┬────┘    └──────────────┘              └──────────────────┘
+        │
+        │ (polled every 15 min)
+        ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  Warehouse staff:                                            │
+   │    1. Opens email, prints PDFs                               │
+   │    2. Packages product                                       │
+   │    3. Sticks Wayfair label on box                            │
+   │    4. Hands to FedEx (or whatever carrier Wayfair chose)     │
+   │    5. Creates Item Fulfillment in NetSuite                   │
+   └──────────────┬───────────────────────────────────────────────┘
+                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  func2 — wayfair-func2-if-to-asn (every 15 min)              │
+   │                                                              │
+   │  1. Read SOs from wayfair_so_log (last 3 days, SUCCESS)      │
+   │  2. For each SO: SuiteQL query → find IF                     │
+   │  3. If IF exists:                                            │
+   │     a. Read tracking+carrier from wayfair_reg_log            │
+   │        (NS tracking is fallback only)                        │
+   │     b. Get PO destination from Wayfair                       │
+   │     c. Send ASN (shipment mutation) to Wayfair               │
+   │  4. Log to BQ                                                │
+   └────────────┬─────────────────────────────────────────────────┘
+                ▼
+   ┌──────────────────┐
+   │  BQ  asn_log     │
+   └──────────────────┘
 ```
 
-## Repo layout
+## Service summary
+
+| Service | Schedule | What it does |
+|---|---|---|
+| **func1** `wayfair-func1-po-to-so` | every 10 min | Pulls new dropship POs from Wayfair → accepts line items → creates Sales Orders in NetSuite (with serial numbers + line-level discount) → registers shipment in Wayfair → downloads shipping label + packing slip PDFs → emails warehouse |
+| **func2** `wayfair-func2-if-to-asn` | every 15 min | For each SO created by func1, checks if Item Fulfillment exists in NetSuite → forwards tracking number to Wayfair as ASN |
+
+## Project structure
 
 ```
-.
-├── shared/                    # OAuth, NetSuite, Wayfair, BQ — used by both funcs
-│   ├── config.py              # env-based config (Secret Manager in prod)
-│   ├── netsuite.py            # OAuth, SuiteQL, inventory, SO creation
-│   ├── wayfair.py             # token, get_po, accept, send_asn
-│   ├── bigquery_log.py        # ensure_tables, dedup, writes
-│   └── http_helpers.py
+mb_wayfair_asn/
+├── shared/                       # Shared modules used by both services
+│   ├── config.py                 # Env-based configuration (secrets, flags)
+│   ├── http_helpers.py           # urllib wrappers (POST JSON, GET binary)
+│   ├── netsuite.py               # OAuth, SuiteQL, serials, SO creation
+│   ├── wayfair.py                # GraphQL: token, get POs, accept, register, labels, ASN
+│   ├── bigquery_log.py           # Logging tables (so/asn/reg) + dedup + SKU map
+│   └── email_notify.py           # Gmail SMTP with PDF attachments
 ├── func1_po_to_so/
-│   ├── main.py                # Flask app, runs the pipeline
-│   ├── requirements.txt
-│   └── Dockerfile
+│   ├── main.py                   # Flask app — full PO→SO→Register→Labels→Email flow
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── func2_if_to_asn/
-│   ├── main.py
-│   ├── requirements.txt
-│   └── Dockerfile
+│   ├── main.py                   # Flask app — pure IF→ASN
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── .github/workflows/
-│   ├── deploy-func1.yml       # GitHub Actions → Cloud Run
+│   ├── deploy-func1.yml          # GitHub Actions: WIF auth → Docker build → Cloud Run
 │   └── deploy-func2.yml
 ├── scripts/
-│   ├── setup.sh               # one-time GCP infra provisioning
-│   └── setup-scheduler.sh     # Cloud Scheduler jobs (after first deploy)
-└── .env.example               # local development template
+│   ├── setup.sh                  # One-time GCP setup (APIs, SAs, WIF, Secret Manager)
+│   ├── setup-scheduler.sh        # Creates Cloud Scheduler jobs
+│   └── rollback.sh               # Rolls Cloud Run service to previous revision
+├── DEPLOY_GUIDE.md               # Step-by-step upgrade/deploy guide
+└── README.md                     # This file
 ```
 
-## Deploy from scratch
+## Configuration
 
-### 1. One-time GCP setup
+All config is read from environment variables (Cloud Run pulls these from Secret Manager + variables defined in workflows).
 
-Edit the top of `scripts/setup.sh` (`PROJECT_ID`, `GITHUB_OWNER`, `GITHUB_REPO`), then:
+### Runtime variables (non-secret)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ENVIRONMENT` | `sandbox` | `sandbox` or `production` — switches Wayfair API base URL |
+| `DRY_RUN` | `false` | If `true`, skips actual Wayfair/NetSuite mutations |
+| `LOOKBACK_DAYS` | `3` | How far back to look for POs / SOs |
+| `PICKUP_OFFSET_DAYS` | `3` | Days after register to schedule carrier pickup. Clamped 2..5. |
+| `FORCE_CARRIER` | `FEDEX` | Used by func2 when Wayfair didn't return one |
+| `WAYFAIR_WAREHOUSE_ID` | `267342` | Wayfair-assigned warehouse identifier |
+| `WAYFAIR_NET_FACTOR` | `0.83` | Net-of-discount factor for retail-price calculation |
+| `RETAIL_PRICELEVEL_ID` | `1` | NetSuite price level used for retail price (Base Price) |
+| `DISCOUNT_ITEM_ID` | `10463` | NS internal id of the Discount item used in SO |
+| `EXCLUDED_LOCATIONS` | `15,20` | NS location ids to exclude when picking serials |
+| `EMAIL_ENABLED` | `true` | Toggle off to silence emails |
+| `EMAIL_TO` | `sale@maestrobath.com` | Primary recipient |
+| `EMAIL_CC` | (johnny, fernando, mehdi, data) @ maestrobath.com | Comma-separated |
+
+### Secrets (Google Secret Manager)
+
+| Secret | Used by |
+|---|---|
+| `netsuite-realm` | both |
+| `netsuite-consumer-key` | both |
+| `netsuite-consumer-secret` | both |
+| `netsuite-token` | both |
+| `netsuite-token-secret` | both |
+| `wayfair-client-id` | both |
+| `wayfair-client-secret` | both |
+| `email-app-password` | func1 only |
+
+## Deployment
+
+GitHub Actions deploys both services automatically on push to `main`. See `DEPLOY_GUIDE.md` for the full step-by-step (Secret Manager setup, GitHub variables, scheduler).
+
+### Manual smoke test
 
 ```bash
-bash scripts/setup.sh
+# func1 — full PO → SO → Register → Labels → Email
+SVC=$(gcloud run services describe wayfair-func1-po-to-so \
+        --region=us-central1 --project=maestrobath --format='value(status.url)')
+curl -X POST "$SVC/" \
+  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  -H "Content-Type: application/json"
+
+# func2 — IF → ASN
+SVC2=$(gcloud run services describe wayfair-func2-if-to-asn \
+         --region=us-central1 --project=maestrobath --format='value(status.url)')
+curl -X POST "$SVC2/" \
+  -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  -H "Content-Type: application/json"
 ```
 
-This enables APIs, creates the Artifact Registry repo, two service accounts (runtime + deployer), grants IAM, configures Workload Identity Federation, and creates empty Secret Manager entries.
-
-### 2. Populate secrets
+### Manual scheduler trigger
 
 ```bash
-echo -n 'YOUR_VALUE' | gcloud secrets versions add netsuite-realm           --data-file=- --project=maestrobath
-echo -n 'YOUR_VALUE' | gcloud secrets versions add netsuite-consumer-key    --data-file=- --project=maestrobath
-echo -n 'YOUR_VALUE' | gcloud secrets versions add netsuite-consumer-secret --data-file=- --project=maestrobath
-echo -n 'YOUR_VALUE' | gcloud secrets versions add netsuite-token           --data-file=- --project=maestrobath
-echo -n 'YOUR_VALUE' | gcloud secrets versions add netsuite-token-secret    --data-file=- --project=maestrobath
-echo -n 'YOUR_VALUE' | gcloud secrets versions add wayfair-client-id        --data-file=- --project=maestrobath
-echo -n 'YOUR_VALUE' | gcloud secrets versions add wayfair-client-secret    --data-file=- --project=maestrobath
+gcloud scheduler jobs run wayfair-func1-po-to-so --location=us-central1
+gcloud scheduler jobs run wayfair-func2-if-to-asn --location=us-central1
 ```
 
-### 3. Configure GitHub
-
-In `Settings → Secrets and variables → Actions`:
-
-**Secrets:**
-- `WIF_PROVIDER` — full WIF provider resource (printed by `setup.sh`)
-- `WIF_SERVICE_ACCOUNT` — `wayfair-deployer@maestrobath.iam.gserviceaccount.com`
-
-**Variables:**
-- `GCP_PROJECT_ID` = `maestrobath`
-- `GCP_REGION` = `us-central1`
-- `RUNTIME_SERVICE_ACCOUNT` = `wayfair-runtime@maestrobath.iam.gserviceaccount.com`
-- `BQ_PROJECT_ID` = `maestrobath`
-- `BQ_DATASET` = `wayfair_inventory`
-- `WF_ENVIRONMENT` = `sandbox` (switch to `production` later)
-
-### 4. First deploy
+### Tweak env var without redeploy
 
 ```bash
-git push origin main
+gcloud run services update wayfair-func1-po-to-so \
+  --region=us-central1 \
+  --update-env-vars="PICKUP_OFFSET_DAYS=4"
 ```
 
-GitHub Actions runs `deploy-func1.yml` + `deploy-func2.yml`. Watch the run, get the service URLs, then:
+## Logging
 
-### 5. Schedule
+Three layers of observability.
+
+### 1. BigQuery (durable, for analytics)
+
+| Table | Written when | Key columns |
+|---|---|---|
+| `wayfair_so_log` | Each PO processed | `wayfair_po`, `so_number`, `so_internal_id`, `wf_accept_id`, `item_count`, `status`, `error_message`, `po_date`, `logged_at` |
+| `wayfair_reg_log` | Each Wayfair registration | `wayfair_po`, `so_number`, `register_event_id`, `pickup_date`, `tracking_number`, `carrier_code`, `label_path`, `status`, `error_message`, `logged_at` |
+| `wayfair_asn_log` | Each ASN sent | `so_number`, `if_number`, `wayfair_po`, `tracking_number`, `carrier`, `wayfair_shipment_id`, `status`, `error_message`, `logged_at` |
+
+Example: find recent failures
+```sql
+SELECT logged_at, wayfair_po, status, error_message
+FROM `maestrobath.wayfair_inventory.wayfair_so_log`
+WHERE status = 'FAILED'
+  AND logged_at > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+ORDER BY logged_at DESC
+```
+
+### 2. Cloud Logging (stdout from Cloud Run)
+
+Every `print()` in the code goes here. Last hour for func1:
 
 ```bash
-bash scripts/setup-scheduler.sh
+gcloud logging read 'resource.labels.service_name="wayfair-func1-po-to-so"' \
+  --project=maestrobath --limit=100 --freshness=1h --format='value(textPayload)'
 ```
 
-Done. Cron-driven from this point on.
+Or in Cloud Console: filter `resource.labels.service_name="wayfair-func1-po-to-so"`.
 
-## Local development
+### 3. HTTP response (per-run summary)
+
+Each `POST /` returns a JSON summary you can pipe through `jq`:
+
+```json
+{
+  "status": "ok",
+  "duration_s": 45.95,
+  "summary": {"SUCCESS": 2, "SKIPPED_ALREADY_DONE": 2, "FAILED": 0, ...},
+  "processed": [
+    {"po": "CS655146656", "status": "SUCCESS"},
+    {"po": "CS654954003", "status": "SUCCESS"}
+  ]
+}
+```
+
+## Rollback
+
+Three layers of rollback, easiest to hardest.
+
+### 1. Cloud Run revision (no git)
+
+Every deploy keeps the previous revision. Switch traffic in seconds:
 
 ```bash
-cp .env.example .env       # fill in values
-gcloud auth application-default login   # for BigQuery
-
-python -m venv .venv && source .venv/bin/activate
-pip install -r func1_po_to_so/requirements.txt
-
-# Run func1 locally
-PYTHONPATH=. python func1_po_to_so/main.py
-# In another terminal:
-curl -X POST http://localhost:8080/
+bash scripts/rollback.sh func1
+bash scripts/rollback.sh func2
 ```
 
-## Switching sandbox → production
+The script lists recent revisions and asks which one to route 100% traffic to.
 
-1. Update `WF_ENVIRONMENT` GitHub variable to `production`
-2. Update the secrets `wayfair-client-id` / `wayfair-client-secret` to the production app's creds
-3. Update `SOURCE_ADDR_*` env vars in the workflows (real warehouse address)
-4. Push to main → both services redeploy
-5. Verify with one manual trigger via `gcloud scheduler jobs run …` before letting cron take over
+### 2. Re-deploy a previous Docker image (no git)
 
-## Operational notes
+```bash
+gcloud run deploy wayfair-func1-po-to-so \
+  --image=us-central1-docker.pkg.dev/maestrobath/wayfair-netsuite/wayfair-func1:OLDER_SHA \
+  --region=us-central1 ...
+```
 
-- **Idempotency:** BQ logs are the source of truth for dedup. If you need to re-process a PO, mark its row in `wayfair_so_log` as anything other than `SUCCESS` (or delete it).
-- **Wayfair sandbox quirks:** sandbox often ignores `fromDate` and returns un-acceptable test POs. `CLIENT_SIDE_DATE_FILTER=true` patches this. `ONLY_NEW_POS=false` is safer in this case (rely on BQ dedup, not Wayfair's `hasResponse`).
-- **Cloud Run timeout:** services configured for 60-minute timeout. Schedules attempt-deadline is 30 minutes. Lookback of 3 days × max ~50 POs comfortably fits.
-- **Failure handling:** any per-PO/IF failure is logged with `status='FAILED'` and the run continues. The HTTP response is still `200` so Cloud Scheduler doesn't retry blindly.
-- **Logs:** Cloud Run logs go to Cloud Logging. Filter `resource.labels.service_name="wayfair-func1-po-to-so"`.
+Tags by commit SHA are preserved in Artifact Registry indefinitely.
+
+### 3. Git revert
+
+```bash
+git revert <bad-commit-sha>
+git push
+```
+
+GitHub Actions will re-deploy automatically.
+
+## Wayfair production migration
+
+Before flipping `ENVIRONMENT=production`:
+
+1. Set production source address via Cloud Run env vars (or extend `shared/config.py` for per-location lookup):
+   ```bash
+   gcloud run services update wayfair-func1-po-to-so \
+     --update-env-vars="SOURCE_ADDR_STREET1=21 Rancho Cir,SOURCE_ADDR_CITY=Lake Forest,SOURCE_ADDR_STATE=CA,SOURCE_ADDR_POSTAL=92630"
+   ```
+2. Create a Production Application on `partners.wayfair.com` and update secrets:
+   ```bash
+   echo -n 'PROD_CLIENT_ID'     | gcloud secrets versions add wayfair-client-id     --data-file=-
+   echo -n 'PROD_CLIENT_SECRET' | gcloud secrets versions add wayfair-client-secret --data-file=-
+   ```
+3. Switch GitHub Actions variable `WF_ENVIRONMENT` to `production`.
+4. Push any commit → both services redeploy with new config.
+5. Rotate the Gmail App Password (`email-app-password`) — the sandbox-era value should not be reused.
+
+## Why the flow split (func1 = full PO+register, func2 = ASN only)
+
+In an earlier iteration, register + labels + email all lived in func2 and waited for an Item Fulfillment to exist in NS. That created a chicken-and-egg problem: the warehouse couldn't print the Wayfair label until they manually created the IF — but they typically created the IF *after* shipping.
+
+Now func1 does register/labels/email immediately after creating the SO. The warehouse always has the label first, ships physically, then records IF in NS. func2 just confirms the shipment with Wayfair (ASN) once IF appears with the tracking number.
+
+## Owner
+
+`vhalstiandata` / `diroxik@gmail.com`. NetSuite realm 8104048, Wayfair supplier id 267342.
