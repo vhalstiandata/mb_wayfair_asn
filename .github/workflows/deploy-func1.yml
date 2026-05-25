@@ -70,6 +70,11 @@ jobs:
             --set-env-vars="PICKUP_OFFSET_DAYS=${{ vars.PICKUP_OFFSET_DAYS }}" \
             --set-env-vars="BQ_PROJECT_ID=${{ vars.BQ_PROJECT_ID }}" \
             --set-env-vars="BQ_DATASET=${{ vars.BQ_DATASET }}" \
+            --set-env-vars="SOURCE_ADDR_NAME=${{ vars.SOURCE_ADDR_NAME }}" \
+            --set-env-vars="SOURCE_ADDR_STREET1=${{ vars.SOURCE_ADDR_STREET1 }}" \
+            --set-env-vars="SOURCE_ADDR_CITY=${{ vars.SOURCE_ADDR_CITY }}" \
+            --set-env-vars="SOURCE_ADDR_STATE=${{ vars.SOURCE_ADDR_STATE }}" \
+            --set-env-vars="SOURCE_ADDR_POSTAL=${{ vars.SOURCE_ADDR_POSTAL }}" \
             --set-env-vars="WAYFAIR_WAREHOUSE_ID=${{ vars.WAYFAIR_WAREHOUSE_ID }}" \
             --set-env-vars="EMAIL_ENABLED=true" \
             --set-env-vars="EMAIL_ADDR=sale@maestrobath.com" \
