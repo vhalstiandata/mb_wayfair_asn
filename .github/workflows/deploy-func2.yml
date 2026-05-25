@@ -80,3 +80,4 @@ jobs:
         run: |
           URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --format='value(status.url)')
           echo "Service URL: $URL"
+
