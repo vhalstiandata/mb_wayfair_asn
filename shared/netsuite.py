@@ -367,3 +367,35 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
     if not rows:
         return None, None
     return rows[0].get("tranid"), str(rows[0].get("id"))
+
+
+# ==============================================================================
+# DEDUP: find existing SO by Wayfair PO (otherrefnum)
+# ==============================================================================
+def find_so_by_otherrefnum(po_number: str):
+    """
+    Find existing Sales Order in NetSuite by Wayfair PO number (otherrefnum).
+    Returns dict {id, tranid, trandate} or None.
+
+    Used for deduplication — covers both programmatically-created SOs AND
+    SOs that warehouse staff created manually. Prevents duplicate SOs from
+    being generated when func1 runs.
+
+    Safe — read-only SuiteQL query.
+    """
+    if not po_number:
+        return None
+    # Escape single quotes in PO (paranoid; PO numbers shouldn't contain them)
+    safe_po = str(po_number).replace("'", "''")
+    rows = ns_suiteql(
+        f"SELECT id, tranid, trandate FROM salesorder "
+        f"WHERE otherrefnum = '{safe_po}' "
+        f"ORDER BY id DESC FETCH FIRST 1 ROWS ONLY"
+    )
+    if not rows:
+        return None
+    return {
+        "id":       str(rows[0].get("id")),
+        "tranid":   rows[0].get("tranid"),
+        "trandate": rows[0].get("trandate"),
+    }

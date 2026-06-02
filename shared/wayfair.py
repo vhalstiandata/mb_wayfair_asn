@@ -294,6 +294,46 @@ def download_packing_slip(wf_token, po_number, save_dir=None):
                          ("pdf", "octet-stream"))
 
 
+def download_bol(wf_token, po_number, save_dir=None):
+    """
+    Download Bill of Lading PDF.
+    BOL is generated only for LTL (less-than-truckload) shipments,
+    not for small-parcel (FedEx/UPS) shipments. Returns None silently
+    if BOL is not applicable for this PO.
+    """
+    save_dir = save_dir or cfg.LABEL_DOWNLOAD_DIR
+    url = f"{cfg.WAYFAIR_REST_BASE}/bill_of_lading/{po_number}"
+    status, content_type, body = urllib_get_binary(
+        url,
+        {"Authorization": f"Bearer {wf_token}", "Accept": "application/pdf"},
+        timeout=30,
+    )
+    if status != 200:
+        # 404 means no BOL for this PO (small parcel) — silently ignore
+        return None
+    return _save_binary(po_number, body, content_type, save_dir, "bol",
+                         ("pdf", "octet-stream"))
+
+
+def download_po_pdf(wf_token, po_number, save_dir=None):
+    """
+    Attempt to download the PO PDF (order details). Wayfair doesn't expose
+    a stable REST endpoint for this on every plan; we try the common path.
+    Returns None silently on 404 or unexpected content-type.
+    """
+    save_dir = save_dir or cfg.LABEL_DOWNLOAD_DIR
+    url = f"{cfg.WAYFAIR_REST_BASE}/purchase_order/{po_number}"
+    status, content_type, body = urllib_get_binary(
+        url,
+        {"Authorization": f"Bearer {wf_token}", "Accept": "application/pdf"},
+        timeout=30,
+    )
+    if status != 200:
+        return None
+    return _save_binary(po_number, body, content_type, save_dir, "po",
+                         ("pdf", "octet-stream"))
+
+
 # ==============================================================================
 # SHIP NOTICE (ASN)
 # ==============================================================================

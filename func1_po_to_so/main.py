@@ -74,6 +74,7 @@ def post_so_actions(wayfair_po, so_number, accepted_items, wf_token, bq):
     # ----- Download labels (non-fatal) -----
     label_path = None
     packing_path = None
+    bol_path = None
     try:
         label_path = wf.download_shipping_label(wf_token, wayfair_po)
     except Exception as e:
@@ -84,12 +85,20 @@ def post_so_actions(wayfair_po, so_number, accepted_items, wf_token, bq):
     except Exception as e:
         print(f"    Packing slip download failed (non-fatal): {e}")
 
+    try:
+        bol_path = wf.download_bol(wf_token, wayfair_po)
+        if bol_path:
+            print(f"    BOL downloaded: {bol_path}")
+    except Exception as e:
+        print(f"    BOL download failed (non-fatal): {e}")
+
     reg_info = {
         "register_event_id": str(reg.get("id")) if reg.get("id") else None,
         "tracking_number":   reg.get("trackingNumber"),
         "carrier_code":      reg.get("carrierCode"),
         "label_path":        label_path,
         "packing_path":      packing_path,
+        "bol_path":          bol_path,
     }
 
     bqlog.write_reg_log(bq, {
@@ -108,7 +117,7 @@ def post_so_actions(wayfair_po, so_number, accepted_items, wf_token, bq):
     try:
         email.send_so_email(
             wayfair_po, so_number, accepted_items, reg_info,
-            label_path=label_path, packing_path=packing_path,
+            label_path=label_path, packing_path=packing_path, bol_path=bol_path,
         )
     except Exception as e:
         print(f"    Email failed (non-fatal): {e}")
@@ -125,9 +134,34 @@ def process_po(po, wf_token, sku_map, bq):
 
     print(f"\n=== PO {po_number} ===")
 
+    # Dedup #1: BQ wayfair_so_log (our own log)
     if bqlog.so_already_processed(bq, po_number):
         print(f"  Already in log as SUCCESS — SKIP")
         return "SKIPPED_ALREADY_DONE", None
+
+    # Dedup #2: NetSuite otherrefnum (catches SOs that warehouse created manually)
+    existing_so = ns.find_so_by_otherrefnum(po_number)
+    if existing_so:
+        print(f"  SO already exists in NetSuite: {existing_so['tranid']} "
+              f"(id {existing_so['id']}) — SKIP")
+        # Sync to BQ so future runs short-circuit on dedup #1
+        bqlog.write_so_log(bq, {
+            "logged_at":      datetime.utcnow().isoformat(),
+            "wayfair_po":     po_number,
+            "po_date":        po_date,
+            "so_number":      existing_so["tranid"],
+            "so_internal_id": existing_so["id"],
+            "wf_accept_id":   None,
+            "item_count":     None,
+            "status":         "SUCCESS",
+            "error_message":  "Pre-existing SO in NetSuite (manual or external)",
+            "environment":    cfg.ENVIRONMENT,
+        })
+        return "SKIPPED_ALREADY_DONE", {
+            "reason":         "exists_in_ns",
+            "so_number":      existing_so["tranid"],
+            "so_internal_id": existing_so["id"],
+        }
 
     accepted_items = []
     unmapped, short_stock = [], []

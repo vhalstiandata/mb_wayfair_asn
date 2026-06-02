@@ -11,10 +11,10 @@ from shared import config as cfg
 
 
 def send_so_email(po_number, so_number, items, reg_result,
-                  label_path=None, packing_path=None):
+                  label_path=None, packing_path=None, bol_path=None):
     """
     Send email notification when a new SO is created.
-    Attaches shipping label and packing slip PDFs if available.
+    Attaches shipping label, packing slip, and (if available) BOL PDF.
     Non-fatal: logs and returns False on failure.
     """
     if not cfg.EMAIL_ENABLED or not cfg.EMAIL_APP_PASSWORD:
@@ -58,6 +58,7 @@ Shipping:
 Attachments:
   Shipping Label:  {'Attached' if label_path else 'Not available'}
   Packing Slip:    {'Attached' if packing_path else 'Not available'}
+  Bill of Lading:  {'Attached' if bol_path else 'Not applicable (small parcel)'}
 
 ---
 Automated notification from Wayfair Integration ({cfg.ENVIRONMENT})
@@ -86,6 +87,14 @@ Automated notification from Wayfair Integration ({cfg.ENVIRONMENT})
                 att = MIMEApplication(f.read(), _subtype="pdf")
                 att.add_header("Content-Disposition", "attachment",
                                filename=os.path.basename(packing_path))
+                msg.attach(att)
+
+        # Attach Bill of Lading PDF (LTL only — usually absent for small parcel)
+        if bol_path and os.path.exists(bol_path):
+            with open(bol_path, "rb") as f:
+                att = MIMEApplication(f.read(), _subtype="pdf")
+                att.add_header("Content-Disposition", "attachment",
+                               filename=os.path.basename(bol_path))
                 msg.attach(att)
 
         all_recipients = [cfg.EMAIL_TO] + cfg.EMAIL_CC
