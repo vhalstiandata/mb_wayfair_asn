@@ -95,7 +95,13 @@ def get_po_data(wf_token: str, po_number: str) -> dict:
 # ==============================================================================
 # ACCEPT
 # ==============================================================================
-def acknowledge_po(wf_token: str, po_number: str, accepted_items: list):
+def acknowledge_po(wf_token: str, po_number: str, accepted_items: list, ship_speed: str = "GROUND"):
+    """Accept a PO in Wayfair using the official mutation format.
+    
+    Uses shipSpeed as a GraphQL variable (not enum literal) and requests
+    full TransactionStatus response fields per Wayfair API spec:
+    https://developer.wayfair.io/posts/docs/orders-api/reference/GraphQL
+    """
     line_items = [
         {
             "partNumber":        i["wayfair_sku"],
@@ -106,21 +112,57 @@ def acknowledge_po(wf_token: str, po_number: str, accepted_items: list):
         for i in accepted_items
     ]
     query = """
-    mutation AcceptPO($poNumber: String!, $lineItems: [AcceptedLineItemInput!]!) {
-        purchaseOrders {
-            accept(poNumber: $poNumber, lineItems: $lineItems, shipSpeed: GROUND) { id }
+    mutation accept(
+      $poNumber: String!,
+      $shipSpeed: ShipSpeed!,
+      $lineItems: [AcceptedLineItemInput!]!
+    ) {
+      purchaseOrders {
+        accept(
+          poNumber: $poNumber,
+          shipSpeed: $shipSpeed,
+          lineItems: $lineItems
+        ) {
+          id
+          handle
+          status
+          submittedAt
+          itemCount
+          errorCount
+          errors { key message }
         }
+      }
     }
     """
     status, data = urllib_post(
         cfg.WAYFAIR_GQL_URL,
-        {"query": query, "variables": {"poNumber": po_number, "lineItems": line_items}},
+        {
+            "query": query,
+            "variables": {
+                "poNumber":  po_number,
+                "shipSpeed": ship_speed,
+                "lineItems": line_items,
+            },
+        },
         {"Authorization": f"Bearer {wf_token}", "Content-Type": "application/json"},
         timeout=30,
     )
     if status != 200 or "errors" in data:
         raise RuntimeError(f"Accept failed for {po_number}: {data.get('errors', data)}")
-    return data.get("data", {}).get("purchaseOrders", {}).get("accept", {}).get("id")
+
+    accept = (data.get("data") or {}).get("purchaseOrders", {}).get("accept") or {}
+    accept_id   = accept.get("id")
+    error_count = accept.get("errorCount", 0)
+    errors      = accept.get("errors") or []
+
+    if not accept_id:
+        raise RuntimeError(f"Accept failed for {po_number}: no accept_id returned. Response: {data}")
+
+    if error_count > 0:
+        # Wayfair прийняв запит але деякі items частково відхилив
+        print(f"    ⚠ Accept for {po_number}: errorCount={error_count}, errors={errors}")
+
+    return accept_id
 
 
 # ==============================================================================
