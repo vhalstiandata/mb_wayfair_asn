@@ -171,7 +171,7 @@ def process_po(po, wf_token, sku_map, bq):
         qty    = int(p["quantity"])
         price  = float(p.get("price") or 0)
 
-        match = sku_map[sku_map["wayfair_sku"] == wf_sku]
+        match = sku_map[sku_map["wayfair_sku"].str.upper() == wf_sku.upper()]
         if match.empty:
             unmapped.append(wf_sku)
             print(f"  Unmapped: {wf_sku}")
