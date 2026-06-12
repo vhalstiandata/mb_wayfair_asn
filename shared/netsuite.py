@@ -7,6 +7,7 @@ import hashlib
 import base64
 import urllib.parse
 import io
+from datetime import datetime 
 
 import requests
 import pandas as pd
@@ -338,6 +339,9 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
     if not ns_items:
         return None, None
 
+    
+    deadline_today = datetime.utcnow().strftime("%Y-%m-%d")
+
     payload = {
         "entity":      {"id": cfg.NETSUITE_WAYFAIR_CUSTOMER_ID},
         "otherrefnum": po_number,
@@ -345,6 +349,7 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         "location":    {"id": cfg.NETSUITE_DEFAULT_LOCATION_ID},
         "item":        {"items": ns_items},
         "custbody_mb_ready_to_ship": True,
+        "custbody_mb_so_deadline":   deadline_today,   
         "istaxable":   False,
     }
     if po_date:
