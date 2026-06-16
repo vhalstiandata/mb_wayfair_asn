@@ -260,7 +260,7 @@ def build_wf_inventory_table(df: pd.DataFrame) -> pd.DataFrame:
 # ==============================================================================
 # CREATE SALES ORDER (multi-location aware)
 # ==============================================================================
-def create_sales_order(po_number: str, accepted_items: list, po_date: str = None):
+def create_sales_order(po_number: str, accepted_items: list, po_date: str = None, deadline: str = None):
     """
     Create a Sales Order. Each item may span multiple locations:
     accepted_items[i] should contain "allocations" — list of
@@ -340,7 +340,7 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         return None, None
 
     
-    deadline_today = datetime.utcnow().strftime("%Y-%m-%d")
+    deadline_today = deadline or datetime.utcnow().strftime("%Y-%m-%d")
 
     payload = {
         "entity":      {"id": cfg.NETSUITE_WAYFAIR_CUSTOMER_ID},

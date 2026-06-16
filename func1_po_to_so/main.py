@@ -218,9 +218,17 @@ def process_po(po, wf_token, sku_map, bq):
     wf_accept_id = wf.acknowledge_po(wf_token, po_number, accepted_items)
     print(f"  Wayfair Accept ID: {wf_accept_id}")
 
+    # Extract Wayfair's "Must Ship By" date for NS deadline
+    # estimatedShipDate format: "2026-06-15 00:00:00.000000 +00:00" → take YYYY-MM-DD
+    wf_deadline = po.get("estimatedShipDate")
+    if wf_deadline:
+        wf_deadline = wf_deadline[:10]  # "2026-06-15"
+
     # Create SO in NetSuite
-    print(f"  Creating SO in NetSuite...")
-    so_number, so_internal_id = ns.create_sales_order(po_number, accepted_items, po_date)
+    print(f"  Creating SO in NetSuite (deadline={wf_deadline or 'today'})...")
+    so_number, so_internal_id = ns.create_sales_order(
+        po_number, accepted_items, po_date, deadline=wf_deadline
+    )
     if not so_number:
         raise RuntimeError("SO creation returned no tranid")
     print(f"  SO Created: {so_number} (internal id {so_internal_id})")

@@ -40,6 +40,7 @@ def get_open_orders(wf_token: str, from_date_iso: str, only_new: bool):
             limit: $limit, hasResponse: false, fromDate: $fromDate, sortOrder: DESC
           ) {
             poNumber poDate customerName
+            estimatedShipDate
             shipTo { name address1 address2 city state country postalCode phoneNumber }
             products { partNumber quantity price }
           }
@@ -52,6 +53,7 @@ def get_open_orders(wf_token: str, from_date_iso: str, only_new: bool):
             limit: $limit, fromDate: $fromDate, sortOrder: DESC
           ) {
             poNumber poDate customerName
+            estimatedShipDate
             shipTo { name address1 address2 city state country postalCode phoneNumber }
             products { partNumber quantity price }
           }
