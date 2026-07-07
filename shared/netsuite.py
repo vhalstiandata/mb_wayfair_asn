@@ -112,11 +112,12 @@ def _fetch_all_available_serials(item_id: str):
 
 def allocate_serials_multi_location(item_id: str, qty_needed: int):
     """
-    Return a list of location-grouped serial allocations, sorted by location size DESC.
+    Return a list of location-grouped serial allocations, sorted by team-requested
+    priority (Unit R -> B -> A -> CastleGate -> In-Transit; see cfg.LOCATION_PRIORITY).
+    Locations not in the priority list fall to the end (sorted by stock size DESC).
+
     Each entry: { "location": "<loc_id>", "serials": [ {serial_id, serial_number, ...}, ... ] }
     Returns None if total available across all locations < qty_needed.
-
-    Greedy: location with most stock first, take min(qty_needed_remaining, loc_qty).
     """
     all_serials = _fetch_all_available_serials(item_id)
     if not all_serials:
@@ -132,8 +133,24 @@ def allocate_serials_multi_location(item_id: str, qty_needed: int):
     if total < qty_needed:
         return None  # global shortage
 
-    # Locations sorted by stock count DESC (largest first)
-    locations_sorted = sorted(by_loc.keys(), key=lambda l: len(by_loc[l]), reverse=True)
+    # ---- Priority-based sort ----
+    # cfg.LOCATION_PRIORITY = (8, 9, 11, 15, 13)  # Unit R, B, A, CG, In-Transit
+    # Locations in the list: sorted by their position (index) — Unit R first.
+    # Locations NOT in the list: come after, sorted by stock size DESC.
+    priority = cfg.LOCATION_PRIORITY
+
+    def _loc_sort_key(loc_str):
+        try:
+            loc_int = int(loc_str)
+        except (TypeError, ValueError):
+            loc_int = None
+        if loc_int is not None and loc_int in priority:
+            # Tuple: (0=priority group, index in priority list)
+            return (0, priority.index(loc_int))
+        # Tuple: (1=non-priority group, -stock so bigger comes first)
+        return (1, -len(by_loc[loc_str]))
+
+    locations_sorted = sorted(by_loc.keys(), key=_loc_sort_key)
 
     allocations = []
     remaining = qty_needed

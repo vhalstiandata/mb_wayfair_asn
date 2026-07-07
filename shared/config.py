@@ -64,6 +64,28 @@ NETSUITE_DEFAULT_LOCATION_ID = _env("NETSUITE_DEFAULT_LOCATION_ID", "8")
 
 EXCLUDED_LOCATIONS = tuple(int(x) for x in _env("EXCLUDED_LOCATIONS", "15,20").split(","))
 
+# ==============================================================================
+# LOCATION PRIORITY (for SO fulfillment allocation)
+# ==============================================================================
+# When an item has stock in multiple locations, allocate_serials_multi_location
+# takes serials from these locations IN ORDER — even if other locations have
+# more stock. Locations not listed fall to the end (sorted by stock size DESC).
+#
+# Order requested by warehouse team (2026-06-27):
+#   Unit R → Unit B → Unit A → CastleGate → In-Transit
+#
+# NS location IDs (verified via SuiteQL 2026-06-27):
+#   id=8    21Rancho-R     → Unit R
+#   id=9    23322-B        → Unit B
+#   id=11   23561-A        → Unit A
+#   id=15   Castlegate     → CastleGate
+#   id=13   In-Transit     → In transit
+#
+# Overridable via LOCATION_PRIORITY env var (comma-separated int IDs).
+LOCATION_PRIORITY = tuple(
+    int(x) for x in _env("LOCATION_PRIORITY", "8,9,11,15,13").split(",") if x.strip()
+)
+
 # Discount
 WAYFAIR_NET_FACTOR   = float(_env("WAYFAIR_NET_FACTOR", "0.83"))
 DISCOUNT_ITEM_ID     = _env("DISCOUNT_ITEM_ID", "10463")
