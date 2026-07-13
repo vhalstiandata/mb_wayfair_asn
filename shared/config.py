@@ -131,7 +131,7 @@ EMAIL_APP_PASSWORD = _env("EMAIL_APP_PASSWORD", "")
 EMAIL_TO           = _env("EMAIL_TO", "sale@maestrobath.com")
 EMAIL_CC           = [e.strip() for e in _env(
     "EMAIL_CC",
-    "johnny@maestrobath.com,fernando@maestrobath.com,mehdi@maestrobath.com"
+    "johnny@maestrobath.com,fernando@maestrobath.com,mehdi@maestrobath.com,shipping@maestrobath.com"
 ).split(",") if e.strip()]
 
 
