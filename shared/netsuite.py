@@ -366,7 +366,8 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         "location":    {"id": cfg.NETSUITE_DEFAULT_LOCATION_ID},
         "item":        {"items": ns_items},
         "custbody_mb_ready_to_ship": True,
-        "custbody_mb_so_deadline":   deadline_today,   
+        "custbody_mb_so_deadline":   deadline_today,
+        "custbody_deadline_calc":    True,   # prevent NS scheduled script from overwriting our deadline
         "istaxable":   False,
     }
     if po_date:
