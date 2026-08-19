@@ -133,10 +133,6 @@ def allocate_serials_multi_location(item_id: str, qty_needed: int):
     if total < qty_needed:
         return None  # global shortage
 
-    # ---- Priority-based sort ----
-    # cfg.LOCATION_PRIORITY = (8, 9, 11, 15, 13)  # Unit R, B, A, CG, In-Transit
-    # Locations in the list: sorted by their position (index) — Unit R first.
-    # Locations NOT in the list: come after, sorted by stock size DESC.
     priority = cfg.LOCATION_PRIORITY
 
     def _loc_sort_key(loc_str):
@@ -145,9 +141,7 @@ def allocate_serials_multi_location(item_id: str, qty_needed: int):
         except (TypeError, ValueError):
             loc_int = None
         if loc_int is not None and loc_int in priority:
-            # Tuple: (0=priority group, index in priority list)
             return (0, priority.index(loc_int))
-        # Tuple: (1=non-priority group, -stock so bigger comes first)
         return (1, -len(by_loc[loc_str]))
 
     locations_sorted = sorted(by_loc.keys(), key=_loc_sort_key)
@@ -168,16 +162,12 @@ def allocate_serials_multi_location(item_id: str, qty_needed: int):
     return allocations
 
 
-# Backwards compatibility: keep old single-location helper available.
-# Returns serials list (single location) OR None — preserves prior behaviour.
 def get_serials(item_id: str, qty: int):
     allocs = allocate_serials_multi_location(item_id, qty)
     if not allocs:
         return None
     if len(allocs) == 1:
         return allocs[0]["serials"]
-    # Multi-location → caller should use allocate_serials_multi_location directly.
-    # Return all flat serials so callers that don't yet know about multi-loc still work.
     return [s for a in allocs for s in a["serials"]]
 
 
@@ -215,7 +205,6 @@ def get_fulfillments_for_so(so_internal_id: str):
 
 
 def get_so_items(so_internal_id: str):
-    """Return list of {oracle_sku, ordered_qty} for an SO (for email body)."""
     rows = ns_suiteql(f"""
         SELECT
             BUILTIN.DF(tl.item)  AS oracle_sku,
@@ -275,16 +264,19 @@ def build_wf_inventory_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ==============================================================================
-# CREATE SALES ORDER (multi-location aware)
+# CREATE SALES ORDER (multi-location aware + backorder support)
 # ==============================================================================
 def create_sales_order(po_number: str, accepted_items: list, po_date: str = None, deadline: str = None):
     """
-    Create a Sales Order. Each item may span multiple locations:
-    accepted_items[i] should contain "allocations" — list of
-    {"location": "<loc_id>", "serials": [...]}. If absent, falls back to old
-    "serials" key (single location). For each allocation we create:
-      - 1 NS line for the item (qty=len(serials), location=loc, serials assigned)
-      - 1 discount line (qty=1, rate = -(disc_per_unit * qty)) — if applicable
+    Create a Sales Order.
+
+    For each accepted_item:
+      - If `allocations` present → normal path (item + serials at each location,
+        plus discount line).
+      - If `is_backorder=True` and no `allocations` → backorder line: item at
+        default location with quantity, NO inventoryDetail, discount as usual.
+        NS accepts backorder for serialized items — commit_status defaults to
+        "backorder" when no inventory is assigned.
     """
     if cfg.DRY_RUN:
         print("  DRY_RUN — skip SO creation")
@@ -296,9 +288,51 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         oracle_sku    = item.get("oracle_sku", "?")
         wayfair_price = float(item.get("wayfair_price") or 0)
         retail        = item.get("retail_price")
+        is_backorder  = bool(item.get("is_backorder"))
+        ordered_qty   = int(item.get("ordered_qty") or 0)
 
-        # New schema: allocations. Old schema: flat serials (single loc).
         allocations = item.get("allocations")
+
+        # ─── BACKORDER PATH (fixed_500, no inventory) ──────────────────────
+        if is_backorder or (not allocations and item.get("is_backorder") is not False):
+            if allocations:
+                # Shouldn't happen but just in case — fall through to normal
+                pass
+            elif ordered_qty <= 0:
+                print(f"  × {oracle_sku}: backorder with qty=0 — skipped")
+                continue
+            else:
+                print(f"  • {oracle_sku}: BACKORDER (no inventory) qty={ordered_qty} "
+                      f"@ default loc {cfg.NETSUITE_DEFAULT_LOCATION_ID}")
+
+                # Item line — no inventoryDetail (NS creates as backorder)
+                ns_items.append({
+                    "item":     {"id": item_id},
+                    "quantity": ordered_qty,
+                    "location": {"id": cfg.NETSUITE_DEFAULT_LOCATION_ID},
+                })
+
+                # Discount line (same logic as normal)
+                if retail is None:
+                    print(f"    ⚠ No Base Price for {oracle_sku} — discount skipped")
+                elif wayfair_price <= 0:
+                    print(f"    ⚠ Wayfair price 0 for {oracle_sku} — discount skipped")
+                else:
+                    d_unit = round(retail - cfg.WAYFAIR_NET_FACTOR * wayfair_price, 2)
+                    if d_unit > 0:
+                        d_total = round(d_unit * ordered_qty, 2)
+                        ns_items.append({
+                            "item":     {"id": cfg.DISCOUNT_ITEM_ID},
+                            "quantity": 1,
+                            "rate":     -d_total,
+                        })
+                        print(f"    + discount: retail={retail}, wayfair={wayfair_price}, "
+                              f"unit=-{d_unit}, line_total=-{d_total}")
+                    else:
+                        print(f"    ⚠ retail ≤ 0.83×wayfair — discount skipped")
+                continue  # done with this item
+
+        # ─── NORMAL PATH (with inventory) ──────────────────────────────────
         if not allocations:
             serials = item.get("serials") or []
             if not serials:
@@ -333,7 +367,6 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
                 }
             })
 
-            # ---- Discount line for THIS location's quantity ----
             if retail is None:
                 print(f"    ⚠ No Base Price for {oracle_sku} — discount skipped for this line")
                 continue
@@ -356,7 +389,6 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
     if not ns_items:
         return None, None
 
-    
     deadline_today = deadline or datetime.utcnow().strftime("%Y-%m-%d")
 
     payload = {
@@ -367,7 +399,7 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         "item":        {"items": ns_items},
         "custbody_mb_ready_to_ship": True,
         "custbody_mb_so_deadline":   deadline_today,
-        "custbody_deadline_calc":    True,   # prevent NS scheduled script from overwriting our deadline
+        "custbody_deadline_calc":    True,   # prevent NS scheduled script from overwriting deadline
         "istaxable":   False,
     }
     if po_date:
@@ -396,19 +428,8 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
 # DEDUP: find existing SO by Wayfair PO (otherrefnum)
 # ==============================================================================
 def find_so_by_otherrefnum(po_number: str):
-    """
-    Find existing Sales Order in NetSuite by Wayfair PO number (otherrefnum).
-    Returns dict {id, tranid, trandate} or None.
-
-    Used for deduplication — covers both programmatically-created SOs AND
-    SOs that warehouse staff created manually. Prevents duplicate SOs from
-    being generated when func1 runs.
-
-    Safe — read-only SuiteQL query.
-    """
     if not po_number:
         return None
-    # Escape single quotes in PO (paranoid; PO numbers shouldn't contain them)
     safe_po = str(po_number).replace("'", "''")
     rows = ns_suiteql(
         f"SELECT id, tranid, trandate FROM salesorder "

@@ -5,6 +5,7 @@ Per PO flow:
   1. Pull dropship POs from Wayfair (last LOOKBACK_DAYS)
   2. For each PO not yet in BQ log:
        - Resolve SKUs + serials in NetSuite
+       - For SKUs with no stock BUT in fixed_500 list → allow BACKORDER SO
        - Accept line items in Wayfair
        - Create Sales Order in NetSuite
        - Register shipment in Wayfair (gets tracking + label)
@@ -32,6 +33,7 @@ from shared import netsuite as ns
 from shared import wayfair  as wf
 from shared import bigquery_log as bqlog
 from shared import email_notify as email
+from shared import sheets_lists   # ← NEW
 
 
 app = flask.Flask(__name__)
@@ -128,7 +130,7 @@ def post_so_actions(wayfair_po, so_number, accepted_items, wf_token, bq):
 # ==============================================================================
 # CORE PIPELINE
 # ==============================================================================
-def process_po(po, wf_token, sku_map, bq):
+def process_po(po, wf_token, sku_map, bq, fixed_500_set):
     po_number = po["poNumber"]
     po_date   = po.get("poDate")
 
@@ -165,6 +167,7 @@ def process_po(po, wf_token, sku_map, bq):
 
     accepted_items = []
     unmapped, short_stock = [], []
+    backorder_lines = []   # for logging/summary
 
     for p in po.get("products", []):
         wf_sku = p["partNumber"]
@@ -185,25 +188,43 @@ def process_po(po, wf_token, sku_map, bq):
             continue
 
         serials_allocations = ns.allocate_serials_multi_location(item_id, qty)
-        if not serials_allocations:
+
+        if serials_allocations:
+            # Normal path — we have inventory
+            if len(serials_allocations) > 1:
+                split_summary = ", ".join(f"loc {a['location']}: {len(a['serials'])}"
+                                          for a in serials_allocations)
+                print(f"  {oracle_sku}: split across locations ({split_summary})")
+
+            accepted_items.append({
+                "wayfair_sku":   wf_sku,
+                "oracle_sku":    oracle_sku,
+                "ns_item_id":    item_id,
+                "ordered_qty":   qty,
+                "wayfair_price": price,
+                "retail_price":  ns.get_item_retail_price(item_id),
+                "allocations":   serials_allocations,
+                "is_backorder":  False,
+            })
+        elif oracle_sku.upper() in fixed_500_set:
+            # No inventory BUT SKU is in fixed_500 (procurement will source) → backorder
+            print(f"  {oracle_sku}: no stock but in fixed_500 → BACKORDER "
+                  f"(qty={qty} @ default loc {cfg.NETSUITE_DEFAULT_LOCATION_ID})")
+            backorder_lines.append(oracle_sku)
+            accepted_items.append({
+                "wayfair_sku":   wf_sku,
+                "oracle_sku":    oracle_sku,
+                "ns_item_id":    item_id,
+                "ordered_qty":   qty,
+                "wayfair_price": price,
+                "retail_price":  ns.get_item_retail_price(item_id),
+                "allocations":   None,          # NO serials
+                "is_backorder":  True,
+            })
+        else:
             short_stock.append(oracle_sku)
-            print(f"  No serials for {oracle_sku} (need {qty})")
+            print(f"  No serials for {oracle_sku} (need {qty}) — not in fixed_500 either")
             continue
-
-        if len(serials_allocations) > 1:
-            split_summary = ", ".join(f"loc {a['location']}: {len(a['serials'])}"
-                                       for a in serials_allocations)
-            print(f"  {oracle_sku}: split across locations ({split_summary})")
-
-        accepted_items.append({
-            "wayfair_sku":   wf_sku,
-            "oracle_sku":    oracle_sku,
-            "ns_item_id":    item_id,
-            "ordered_qty":   qty,
-            "wayfair_price": price,
-            "retail_price":  ns.get_item_retail_price(item_id),
-            "allocations":   serials_allocations,
-        })
 
     if not accepted_items:
         print(f"  No fulfillable items — SKIP")
@@ -214,7 +235,8 @@ def process_po(po, wf_token, sku_map, bq):
         return "SKIPPED_PARTIAL", {"unmapped": unmapped, "short_stock": short_stock}
 
     # Accept in Wayfair
-    print(f"  Accepting {len(accepted_items)} line(s) in Wayfair...")
+    print(f"  Accepting {len(accepted_items)} line(s) in Wayfair "
+          f"({len(backorder_lines)} as backorder)...")
     wf_accept_id = wf.acknowledge_po(wf_token, po_number, accepted_items)
     print(f"  Wayfair Accept ID: {wf_accept_id}")
 
@@ -233,15 +255,16 @@ def process_po(po, wf_token, sku_map, bq):
         raise RuntimeError("SO creation returned no tranid")
     print(f"  SO Created: {so_number} (internal id {so_internal_id})")
 
-    # ⭐ NEW: register + labels + email
+    # Register + labels + email (as before)
     reg_info = post_so_actions(po_number, so_number, accepted_items, wf_token, bq)
 
     return "SUCCESS", {
-        "wf_accept_id":   wf_accept_id,
-        "so_number":      so_number,
-        "so_internal_id": so_internal_id,
-        "item_count":     len(accepted_items),
-        "registered":     bool(reg_info),
+        "wf_accept_id":     wf_accept_id,
+        "so_number":        so_number,
+        "so_internal_id":   so_internal_id,
+        "item_count":       len(accepted_items),
+        "backorder_lines":  backorder_lines,
+        "registered":       bool(reg_info),
     }
 
 
@@ -254,6 +277,9 @@ def run_pipeline():
     bq = bqlog.get_bq_client()
     bqlog.ensure_so_log_table(bq)
     bqlog.ensure_reg_log_table(bq)
+
+    # Load fixed_500 SKU set from Google Sheets (shared with wayfair_inventory pipeline)
+    fixed_500_set = sheets_lists.load_fixed_500_skus()
 
     raw_inv  = ns.fetch_inventory()
     wf_table = ns.build_wf_inventory_table(raw_inv)
@@ -291,7 +317,7 @@ def run_pipeline():
         items_n   = len(po.get("products", []))
 
         try:
-            status, detail = process_po(po, wf_token, sku_map, bq)
+            status, detail = process_po(po, wf_token, sku_map, bq, fixed_500_set)
             summary[status] = summary.get(status, 0) + 1
             pos_processed.append({"po": po_number, "status": status})
 
