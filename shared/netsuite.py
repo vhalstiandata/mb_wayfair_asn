@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+import urllib.error
 import io
 from datetime import datetime 
 
@@ -410,7 +411,17 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         "Authorization": ns_oauth_header_rest_api("POST", url),
         "Content-Type":  "application/json",
     }
-    status, data = urllib_post(url, payload, headers)
+    try:
+        status, data = urllib_post(url, payload, headers, timeout=120)
+    except (TimeoutError, urllib.error.URLError) as e:
+        # NetSuite often commits the SO but responds too slowly — check before failing
+        print(f"    SO POST got no response ({e}) — checking if NetSuite created it anyway...")
+        time.sleep(10)
+        existing = find_so_by_otherrefnum(po_number)
+        if existing:
+            print(f"    SO was created despite timeout: {existing['tranid']}")
+            return existing["tranid"], existing["id"]
+        raise
     if status not in (201, 204):
         raise RuntimeError(f"SO creation failed: HTTP {status}, body={str(data)[:1500]}")
 

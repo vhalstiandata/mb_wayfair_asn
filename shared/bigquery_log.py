@@ -152,6 +152,56 @@ def registration_already_done(bq, wayfair_po):
     return None
 
 
+MAX_REG_ATTEMPTS = 5
+
+
+def get_pending_registration(bq, wayfair_po):
+    """
+    SO logged as SUCCESS but Wayfair registration never succeeded → returns
+    {so_number, so_internal_id} so func1 can retry register/labels/email.
+
+    Returns None when:
+      - registration already SUCCESS
+      - Wayfair said the PO is cancelled
+      - MAX_REG_ATTEMPTS failed attempts already
+      - SO is a genuinely manual one ("Pre-existing" with no FAILED attempt of ours before it)
+    """
+    q = f"""
+        WITH so AS (
+            SELECT so_number, so_internal_id, error_message
+            FROM `{cfg.BQ_SO_LOG_TABLE}`
+            WHERE wayfair_po = @po AND status = 'SUCCESS' AND so_number IS NOT NULL
+            ORDER BY logged_at DESC LIMIT 1
+        ),
+        so_fail AS (
+            SELECT COUNT(*) AS c FROM `{cfg.BQ_SO_LOG_TABLE}`
+            WHERE wayfair_po = @po AND status = 'FAILED'
+        ),
+        reg AS (
+            SELECT COUNTIF(status = 'SUCCESS') AS ok,
+                   COUNTIF(status = 'FAILED')  AS fails,
+                   COUNTIF(LOWER(error_message) LIKE '%cancel%') AS cancelled
+            FROM `{cfg.BQ_REG_LOG_TABLE}`
+            WHERE wayfair_po = @po
+        )
+        SELECT so.so_number, so.so_internal_id, so.error_message,
+               so_fail.c AS prior_so_fail, reg.ok, reg.fails, reg.cancelled
+        FROM so, so_fail, reg
+    """
+    job = bq.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("po", "STRING", wayfair_po)]
+    ))
+    rows = list(job.result())
+    if not rows:
+        return None
+    r = rows[0]
+    if r.ok or r.cancelled or r.fails >= MAX_REG_ATTEMPTS:
+        return None
+    if (r.error_message or "").startswith("Pre-existing") and not r.prior_so_fail:
+        return None
+    return {"so_number": r.so_number, "so_internal_id": r.so_internal_id}
+
+
 # ==============================================================================
 # WRITE
 # ==============================================================================

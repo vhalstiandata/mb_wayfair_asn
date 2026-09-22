@@ -211,7 +211,7 @@ def register_shipment(wf_token, po_number, warehouse_id=None, pickup_date=None):
         cfg.WAYFAIR_GQL_URL,
         {"query": query, "variables": {"registrationInput": params}},
         {"Authorization": f"Bearer {wf_token}", "Content-Type": "application/json"},
-        timeout=30,
+        timeout=120,
     )
     if status != 200 or "errors" in data:
         raise RuntimeError(

@@ -127,6 +127,42 @@ def post_so_actions(wayfair_po, so_number, accepted_items, wf_token, bq):
     return reg_info
 
 
+def retry_pending_registration(po, sku_map, wf_token, bq):
+    """
+    SO exists but registration never succeeded (e.g. NS/Wayfair timeout mid-run)
+    → run register/labels/email now. Skips if warehouse already created an IF
+    (they shipped by hand — a new label would only confuse them).
+    """
+    po_number = po["poNumber"]
+    try:
+        pending = bqlog.get_pending_registration(bq, po_number)
+        if not pending:
+            return None
+        return _retry_registration(po, pending, sku_map, wf_token, bq)
+    except Exception as e:
+        print(f"  Registration retry failed (non-fatal): {e}")
+        return None
+
+
+def _retry_registration(po, pending, sku_map, wf_token, bq):
+    po_number = po["poNumber"]
+
+    if pending.get("so_internal_id") and ns.get_fulfillments_for_so(pending["so_internal_id"]):
+        print(f"  Registration missing but IF already exists in NS — leaving as is")
+        return None
+
+    print(f"  SO {pending['so_number']} exists but not registered in Wayfair — retrying")
+    items = []
+    for p in po.get("products", []):
+        match = sku_map[sku_map["wayfair_sku"].str.upper() == p["partNumber"].upper()]
+        items.append({
+            "wayfair_sku": p["partNumber"],
+            "oracle_sku":  match.iloc[0]["oracle_sku"] if not match.empty else "?",
+            "ordered_qty": p.get("quantity"),
+        })
+    return post_so_actions(po_number, pending["so_number"], items, wf_token, bq)
+
+
 # ==============================================================================
 # CORE PIPELINE
 # ==============================================================================
@@ -139,6 +175,7 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
     # Dedup #1: BQ wayfair_so_log (our own log)
     if bqlog.so_already_processed(bq, po_number):
         print(f"  Already in log as SUCCESS — SKIP")
+        retry_pending_registration(po, sku_map, wf_token, bq)
         return "SKIPPED_ALREADY_DONE", None
 
     # Dedup #2: NetSuite otherrefnum (catches SOs that warehouse created manually)
@@ -159,6 +196,8 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
             "error_message":  "Pre-existing SO in NetSuite (manual or external)",
             "environment":    cfg.ENVIRONMENT,
         })
+        # If this SO is ours from a timed-out run, finish register/labels/email
+        retry_pending_registration(po, sku_map, wf_token, bq)
         return "SKIPPED_ALREADY_DONE", {
             "reason":         "exists_in_ns",
             "so_number":      existing_so["tranid"],
