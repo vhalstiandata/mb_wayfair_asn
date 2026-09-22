@@ -133,7 +133,7 @@ def run_pipeline():
     bq = bqlog.get_bq_client()
     bqlog.ensure_asn_log_table(bq)
 
-    sos = bqlog.get_recent_successful_sos(bq, cfg.LOOKBACK_DAYS)
+    sos = bqlog.get_recent_successful_sos(bq, cfg.LOOKBACK_DAYS, cfg.ASN_LOOKBACK_DAYS)
     print(f"Loaded {len(sos)} SO(s) from BQ")
 
     if not sos:

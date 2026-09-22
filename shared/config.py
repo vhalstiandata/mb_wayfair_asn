@@ -28,6 +28,9 @@ CLIENT_SIDE_DATE_FILTER   = _env("CLIENT_SIDE_DATE_FILTER", "true").lower() == "
 
 # Function 2 specifics
 FORCE_CARRIER     = _env("FORCE_CARRIER", "FEDEX")
+# Registered SOs without a successful ASN stay in func2's queue this long
+# (warehouse often creates the IF several days after the SO)
+ASN_LOOKBACK_DAYS = int(_env("ASN_LOOKBACK_DAYS", "30"))
 
 # Wayfair shipment pickup offset (how many days after register we expect carrier pickup)
 # Clamped to 2..5; configurable per environment without redeploy.

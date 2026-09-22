@@ -97,16 +97,39 @@ def so_already_processed(bq, po_number):
     return list(job.result())[0].c > 0
 
 
-def get_recent_successful_sos(bq, lookback_days):
+def get_recent_successful_sos(bq, lookback_days, asn_lookback_days=None):
+    """
+    SOs for func2 to check for IF → ASN:
+      - every SUCCESS SO logged in the last `lookback_days`, plus
+      - SOs registered in Wayfair within `asn_lookback_days` that still have
+        no successful ASN (IF often appears days after the SO).
+    """
+    asn_lookback_days = max(asn_lookback_days or lookback_days, lookback_days)
     q = f"""
+        WITH so AS (
+            SELECT wayfair_po, so_number, so_internal_id, po_date, logged_at,
+                   ROW_NUMBER() OVER (PARTITION BY so_number ORDER BY logged_at DESC) AS rn
+            FROM `{cfg.BQ_SO_LOG_TABLE}`
+            WHERE status = 'SUCCESS' AND so_number IS NOT NULL
+              AND logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @asn_days DAY)
+        )
         SELECT wayfair_po, so_number, so_internal_id, po_date
-        FROM `{cfg.BQ_SO_LOG_TABLE}`
-        WHERE status = 'SUCCESS'
-          AND logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+        FROM so
+        WHERE rn = 1
+          AND (
+            logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+            OR (
+              wayfair_po IN (SELECT wayfair_po FROM `{cfg.BQ_REG_LOG_TABLE}` WHERE status = 'SUCCESS')
+              AND so_number NOT IN (SELECT so_number FROM `{cfg.BQ_ASN_LOG_TABLE}` WHERE status = 'SUCCESS')
+            )
+          )
         ORDER BY logged_at DESC
     """
     job = bq.query(q, job_config=bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("days", "INT64", lookback_days)]
+        query_parameters=[
+            bigquery.ScalarQueryParameter("days", "INT64", lookback_days),
+            bigquery.ScalarQueryParameter("asn_days", "INT64", asn_lookback_days),
+        ]
     ))
     return [dict(r) for r in job.result()]
 
