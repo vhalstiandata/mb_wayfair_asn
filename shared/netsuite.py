@@ -111,6 +111,55 @@ def _fetch_all_available_serials(item_id: str):
     """) or []
 
 
+def is_serialized_item(item_id: str) -> bool:
+    rows = ns_suiteql(f"SELECT isserialitem FROM item WHERE id = {item_id}")
+    return bool(rows) and rows[0].get("isserialitem") == "T"
+
+
+def _fetch_available_by_location(item_id: str):
+    """Non-serialized items: available qty per non-excluded location → {loc_id: qty}."""
+    excluded = ", ".join(str(x) for x in cfg.EXCLUDED_LOCATIONS)
+    rows = ns_suiteql(f"""
+        SELECT location, quantityavailable AS qty_available
+        FROM inventoryitemlocations
+        WHERE item = {item_id}
+          AND quantityavailable > 0
+          AND location NOT IN ({excluded})
+    """) or []
+    return {str(r["location"]): int(float(r["qty_available"])) for r in rows}
+
+
+def _sort_locations(by_loc_size: dict):
+    """Team priority first (cfg.LOCATION_PRIORITY), then the rest by stock size DESC."""
+    priority = cfg.LOCATION_PRIORITY
+
+    def _key(loc_str):
+        try:
+            loc_int = int(loc_str)
+        except (TypeError, ValueError):
+            loc_int = None
+        if loc_int is not None and loc_int in priority:
+            return (0, priority.index(loc_int))
+        return (1, -by_loc_size[loc_str])
+
+    return sorted(by_loc_size.keys(), key=_key)
+
+
+def _allocate_non_serialized(item_id: str, qty_needed: int):
+    """Same shape as serial allocations, but serials=[] and an explicit qty."""
+    by_loc = _fetch_available_by_location(item_id)
+    if sum(by_loc.values()) < qty_needed:
+        return None
+    allocations, remaining = [], qty_needed
+    for loc in _sort_locations(by_loc):
+        if remaining <= 0:
+            break
+        take = min(remaining, by_loc[loc])
+        allocations.append({"location": loc, "serials": [], "qty": take})
+        remaining -= take
+    return allocations
+
+
 def allocate_serials_multi_location(item_id: str, qty_needed: int):
     """
     Return a list of location-grouped serial allocations, sorted by team-requested
@@ -118,10 +167,14 @@ def allocate_serials_multi_location(item_id: str, qty_needed: int):
     Locations not in the priority list fall to the end (sorted by stock size DESC).
 
     Each entry: { "location": "<loc_id>", "serials": [ {serial_id, serial_number, ...}, ... ] }
+    Non-serialized items (e.g. FAU-IKH-BRG, CRI-ICE-TRC) are allocated by location
+    quantity instead: { "location": ..., "serials": [], "qty": N }.
     Returns None if total available across all locations < qty_needed.
     """
     all_serials = _fetch_all_available_serials(item_id)
     if not all_serials:
+        if not is_serialized_item(item_id):
+            return _allocate_non_serialized(item_id, qty_needed)
         return None
 
     # Group by location
@@ -134,18 +187,7 @@ def allocate_serials_multi_location(item_id: str, qty_needed: int):
     if total < qty_needed:
         return None  # global shortage
 
-    priority = cfg.LOCATION_PRIORITY
-
-    def _loc_sort_key(loc_str):
-        try:
-            loc_int = int(loc_str)
-        except (TypeError, ValueError):
-            loc_int = None
-        if loc_int is not None and loc_int in priority:
-            return (0, priority.index(loc_int))
-        return (1, -len(by_loc[loc_str]))
-
-    locations_sorted = sorted(by_loc.keys(), key=_loc_sort_key)
+    locations_sorted = _sort_locations({loc: len(v) for loc, v in by_loc.items()})
 
     allocations = []
     remaining = qty_needed
@@ -347,26 +389,34 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
         for alloc in allocations:
             loc_id  = str(alloc["location"])
             serials = alloc["serials"]
-            qty     = len(serials)
+            qty     = alloc.get("qty") or len(serials)
             if qty <= 0:
                 continue
 
-            print(f"  • {oracle_sku}: serials "
-                  f"{[s.get('serial_number') for s in serials]} @ loc {loc_id} (qty={qty})")
-
-            ns_items.append({
-                "item":     {"id": item_id},
-                "quantity": qty,
-                "location": {"id": loc_id},
-                "inventoryDetail": {
-                    "inventoryAssignment": {
-                        "items": [
-                            {"issueInventoryNumber": {"id": str(s["serial_id"])}, "quantity": 1}
-                            for s in serials
-                        ]
+            if serials:
+                print(f"  • {oracle_sku}: serials "
+                      f"{[s.get('serial_number') for s in serials]} @ loc {loc_id} (qty={qty})")
+                ns_items.append({
+                    "item":     {"id": item_id},
+                    "quantity": qty,
+                    "location": {"id": loc_id},
+                    "inventoryDetail": {
+                        "inventoryAssignment": {
+                            "items": [
+                                {"issueInventoryNumber": {"id": str(s["serial_id"])}, "quantity": 1}
+                                for s in serials
+                            ]
+                        }
                     }
-                }
-            })
+                })
+            else:
+                # Non-serialized item — no inventory detail needed
+                print(f"  • {oracle_sku}: non-serialized @ loc {loc_id} (qty={qty})")
+                ns_items.append({
+                    "item":     {"id": item_id},
+                    "quantity": qty,
+                    "location": {"id": loc_id},
+                })
 
             if retail is None:
                 print(f"    ⚠ No Base Price for {oracle_sku} — discount skipped for this line")

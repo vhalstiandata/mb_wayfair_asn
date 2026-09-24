@@ -231,7 +231,7 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
         if serials_allocations:
             # Normal path — we have inventory
             if len(serials_allocations) > 1:
-                split_summary = ", ".join(f"loc {a['location']}: {len(a['serials'])}"
+                split_summary = ", ".join(f"loc {a['location']}: {a.get('qty') or len(a['serials'])}"
                                           for a in serials_allocations)
                 print(f"  {oracle_sku}: split across locations ({split_summary})")
 
