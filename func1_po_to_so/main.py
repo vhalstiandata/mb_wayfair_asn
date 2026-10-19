@@ -166,32 +166,47 @@ def _retry_registration(po, pending, sku_map, wf_token, bq):
 # ==============================================================================
 # CORE PIPELINE
 # ==============================================================================
-def _add_line(merged, item_id, oracle_sku, wf_sku, qty, price_total):
+def _add_line(merged, item_id, oracle_sku, wf_sku, qty, price_total, retail_total=None):
+    """retail_total=None → item's own Base Price; set for item group components."""
     m = merged.setdefault(item_id, {"oracle_sku": oracle_sku, "wayfair_skus": [],
-                                    "qty": 0, "price_total": 0.0})
+                                    "qty": 0, "price_total": 0.0, "retail_parts": []})
     if wf_sku not in m["wayfair_skus"]:
         m["wayfair_skus"].append(wf_sku)
     m["qty"]         += qty
     m["price_total"] += price_total
+    m["retail_parts"].append((qty, retail_total))
+
+
+def _line_retail(item_id, m):
+    """(retail_per_unit, explicit_rate) — rate only when a group set the component price."""
+    base = ns.get_item_retail_price(item_id)
+    if all(rt is None for _, rt in m["retail_parts"]):
+        return base, None
+    total = sum(rt if rt is not None else (base or 0.0) * q for q, rt in m["retail_parts"])
+    unit = round(total / m["qty"], 2) if m["qty"] else 0.0
+    return unit, unit
 
 
 def _add_group_components(merged, group, wf_sku, qty, price):
     """
     Item Group (e.g. FAU-W21-BGL = FAU-W21-TRM-BGL + VLV-CAS2H-BRS) → add each
-    component as its own line. Wayfair's price for the set is split across the
-    components by Base Price, so the SO total still nets to 0.83 × Wayfair price.
+    component as its own line. The group's selling price
+    (custitem_mb_custom_item_selling_price) and Wayfair's price for the set are
+    both split across components by Base Price, so lines add up to the group
+    price and the SO still nets to 0.83 × Wayfair price.
     """
     members = group["members"]
     retails = {m["id"]: (ns.get_item_retail_price(m["id"]) or 0.0) for m in members}
-    set_retail = sum(retails[m["id"]] * m["qty"] for m in members)
+    base_sum = sum(retails[m["id"]] * m["qty"] for m in members)
+    set_price = group.get("price") or base_sum
     for m in members:
-        if set_retail > 0:
-            share = retails[m["id"]] * m["qty"] / set_retail
+        if base_sum > 0:
+            share = retails[m["id"]] * m["qty"] / base_sum
         else:
             share = 1.0 / len(members)
         _add_line(merged, m["id"], m["itemid"], wf_sku,
-                  qty * m["qty"], price * qty * share)
-    print(f"  {wf_sku} -> {group['itemid']} (item group): "
+                  qty * m["qty"], price * qty * share, set_price * qty * share)
+    print(f"  {wf_sku} -> {group['itemid']} (item group, price {set_price}): "
           + ", ".join(f"{m['itemid']}×{m['qty']}" for m in members))
 
 
@@ -274,6 +289,7 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set, sku_map_all=None):
         wf_sku     = ", ".join(m["wayfair_skus"])
         qty        = m["qty"]
         price      = round(m["price_total"] / qty, 2) if qty else 0.0
+        retail, line_rate = _line_retail(item_id, m)
 
         serials_allocations = ns.allocate_serials_multi_location(item_id, qty)
 
@@ -290,7 +306,8 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set, sku_map_all=None):
                 "ns_item_id":    item_id,
                 "ordered_qty":   qty,
                 "wayfair_price": price,
-                "retail_price":  ns.get_item_retail_price(item_id),
+                "retail_price":  retail,
+                "rate":          line_rate,
                 "allocations":   serials_allocations,
                 "is_backorder":  False,
             })
@@ -305,7 +322,8 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set, sku_map_all=None):
                 "ns_item_id":    item_id,
                 "ordered_qty":   qty,
                 "wayfair_price": price,
-                "retail_price":  ns.get_item_retail_price(item_id),
+                "retail_price":  retail,
+                "rate":          line_rate,
                 "allocations":   None,          # NO serials
                 "is_backorder":  True,
             })

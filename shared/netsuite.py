@@ -214,11 +214,19 @@ def get_serials(item_id: str, qty: int):
     return [s for a in allocs for s in a["serials"]]
 
 
+def _rate_fields(item):
+    """Explicit unit price for the SO line (group components); empty → NS uses Base Price."""
+    if item.get("rate") is None:
+        return {}
+    return {"price": {"id": "-1"}, "rate": item["rate"]}   # -1 = Custom price level
+
+
 def get_item_group(oracle_sku: str):
-    """If `oracle_sku` is an Item Group → {id, itemid, members:[{id, itemid, qty}]}, else None."""
+    """If `oracle_sku` is an Item Group → {id, itemid, price, members:[{id, itemid, qty}]}, else None."""
     safe = str(oracle_sku).replace("'", "''")
     rows = ns_suiteql(f"""
         SELECT g.id AS group_id, g.itemid AS group_sku,
+               g.custitem_mb_custom_item_selling_price AS group_price,
                i.id AS member_id, i.itemid AS member_sku, m.quantity
         FROM item g
         JOIN itemmember m ON m.parentitem = g.id
@@ -228,9 +236,14 @@ def get_item_group(oracle_sku: str):
     """)
     if not rows:
         return None
+    try:
+        group_price = float(rows[0].get("group_price"))
+    except (TypeError, ValueError):
+        group_price = None
     return {
         "id":      str(rows[0]["group_id"]),
         "itemid":  rows[0]["group_sku"],
+        "price":   group_price,   # custitem_mb_custom_item_selling_price
         "members": [{"id": str(r["member_id"]), "itemid": r["member_sku"],
                      "qty": int(float(r["quantity"]))} for r in rows],
     }
@@ -375,6 +388,7 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
                     "item":     {"id": item_id},
                     "quantity": ordered_qty,
                     "location": {"id": cfg.NETSUITE_DEFAULT_LOCATION_ID},
+                    **_rate_fields(item),
                 })
 
                 # Discount line (same logic as normal)
@@ -422,6 +436,7 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
                     "item":     {"id": item_id},
                     "quantity": qty,
                     "location": {"id": loc_id},
+                    **_rate_fields(item),
                     "inventoryDetail": {
                         "inventoryAssignment": {
                             "items": [
@@ -438,6 +453,7 @@ def create_sales_order(po_number: str, accepted_items: list, po_date: str = None
                     "item":     {"id": item_id},
                     "quantity": qty,
                     "location": {"id": loc_id},
+                    **_rate_fields(item),
                 })
 
             if retail is None:
