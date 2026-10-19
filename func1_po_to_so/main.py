@@ -208,6 +208,10 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
     unmapped, short_stock = [], []
     backorder_lines = []   # for logging/summary
 
+    # Wayfair may send the same SKU as several lines (e.g. 2 × qty 1).
+    # Merge them per NS item so serials are allocated once — otherwise each
+    # line picks the same serial and NetSuite rejects the SO.
+    merged = {}   # ns item_id -> {oracle_sku, wayfair_skus, qty, price_total}
     for p in po.get("products", []):
         wf_sku = p["partNumber"]
         qty    = int(p["quantity"])
@@ -225,6 +229,19 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
             unmapped.append(f"{wf_sku} -> {oracle_sku}")
             print(f"  Oracle SKU not in NS: {oracle_sku}")
             continue
+
+        m = merged.setdefault(item_id, {"oracle_sku": oracle_sku, "wayfair_skus": [],
+                                        "qty": 0, "price_total": 0.0})
+        if wf_sku not in m["wayfair_skus"]:
+            m["wayfair_skus"].append(wf_sku)
+        m["qty"]         += qty
+        m["price_total"] += price * qty
+
+    for item_id, m in merged.items():
+        oracle_sku = m["oracle_sku"]
+        wf_sku     = ", ".join(m["wayfair_skus"])
+        qty        = m["qty"]
+        price      = round(m["price_total"] / qty, 2) if qty else 0.0
 
         serials_allocations = ns.allocate_serials_multi_location(item_id, qty)
 
@@ -273,11 +290,19 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
         print(f"  Partial — unmapped={unmapped}, short={short_stock} — SKIP")
         return "SKIPPED_PARTIAL", {"unmapped": unmapped, "short_stock": short_stock}
 
-    # Accept in Wayfair
-    print(f"  Accepting {len(accepted_items)} line(s) in Wayfair "
-          f"({len(backorder_lines)} as backorder)...")
-    wf_accept_id = wf.acknowledge_po(wf_token, po_number, accepted_items)
-    print(f"  Wayfair Accept ID: {wf_accept_id}")
+    # Accept in Wayfair — once per PO (a failed SO creation used to re-accept every run)
+    wf_accept_id = bqlog.get_prior_accept_id(bq, po_number)
+    if wf_accept_id:
+        print(f"  Already accepted in Wayfair (accept id {wf_accept_id}) — not re-accepting")
+    else:
+        wf_lines = [{"wayfair_sku":   p["partNumber"],
+                     "ordered_qty":   int(p["quantity"]),
+                     "wayfair_price": float(p.get("price") or 0)}
+                    for p in po.get("products", [])]
+        print(f"  Accepting {len(wf_lines)} line(s) in Wayfair "
+              f"({len(backorder_lines)} item(s) as backorder)...")
+        wf_accept_id = wf.acknowledge_po(wf_token, po_number, wf_lines)
+        print(f"  Wayfair Accept ID: {wf_accept_id}")
 
     # Extract Wayfair's "Must Ship By" date for NS deadline
     # estimatedShipDate format: "2026-06-15 00:00:00.000000 +00:00" → take YYYY-MM-DD
@@ -287,11 +312,15 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
 
     # Create SO in NetSuite
     print(f"  Creating SO in NetSuite (deadline={wf_deadline or 'today'})...")
-    so_number, so_internal_id = ns.create_sales_order(
-        po_number, accepted_items, po_date, deadline=wf_deadline
-    )
-    if not so_number:
-        raise RuntimeError("SO creation returned no tranid")
+    try:
+        so_number, so_internal_id = ns.create_sales_order(
+            po_number, accepted_items, po_date, deadline=wf_deadline
+        )
+        if not so_number:
+            raise RuntimeError("SO creation returned no tranid")
+    except Exception as e:
+        e.wf_accept_id = wf_accept_id
+        raise
     print(f"  SO Created: {so_number} (internal id {so_internal_id})")
 
     # Register + labels + email (as before)
@@ -382,7 +411,8 @@ def run_pipeline():
                 "logged_at":      datetime.utcnow().isoformat(),
                 "wayfair_po":     po_number,
                 "po_date":        po_date,
-                "so_number":      None, "so_internal_id": None, "wf_accept_id": None,
+                "so_number":      None, "so_internal_id": None,
+                "wf_accept_id":   str(getattr(e, "wf_accept_id", "") or "") or None,
                 "item_count":     items_n,
                 "status":         "FAILED",
                 "error_message":  str(e)[:1000],

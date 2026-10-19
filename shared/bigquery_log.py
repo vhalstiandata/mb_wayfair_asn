@@ -175,6 +175,22 @@ def registration_already_done(bq, wayfair_po):
     return None
 
 
+def get_prior_accept_id(bq, wayfair_po):
+    """Accept id from an earlier run (SUCCESS or FAILED after accept), or None."""
+    q = f"""
+        SELECT wf_accept_id
+        FROM `{cfg.BQ_SO_LOG_TABLE}`
+        WHERE wayfair_po = @po AND wf_accept_id IS NOT NULL
+        ORDER BY logged_at DESC
+        LIMIT 1
+    """
+    job = bq.query(q, job_config=bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("po", "STRING", wayfair_po)]
+    ))
+    rows = list(job.result())
+    return rows[0].wf_accept_id if rows else None
+
+
 MAX_REG_ATTEMPTS = 5
 
 
