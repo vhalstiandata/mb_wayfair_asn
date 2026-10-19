@@ -214,6 +214,28 @@ def get_serials(item_id: str, qty: int):
     return [s for a in allocs for s in a["serials"]]
 
 
+def get_item_group(oracle_sku: str):
+    """If `oracle_sku` is an Item Group → {id, itemid, members:[{id, itemid, qty}]}, else None."""
+    safe = str(oracle_sku).replace("'", "''")
+    rows = ns_suiteql(f"""
+        SELECT g.id AS group_id, g.itemid AS group_sku,
+               i.id AS member_id, i.itemid AS member_sku, m.quantity
+        FROM item g
+        JOIN itemmember m ON m.parentitem = g.id
+        JOIN item i ON i.id = m.item
+        WHERE g.itemid = '{safe}' AND g.itemtype = 'Group'
+        ORDER BY m.linenumber
+    """)
+    if not rows:
+        return None
+    return {
+        "id":      str(rows[0]["group_id"]),
+        "itemid":  rows[0]["group_sku"],
+        "members": [{"id": str(r["member_id"]), "itemid": r["member_sku"],
+                     "qty": int(float(r["quantity"]))} for r in rows],
+    }
+
+
 def get_item_retail_price(item_id: str):
     rows = ns_suiteql(f"""
         SELECT price FROM itemprice

@@ -166,7 +166,36 @@ def _retry_registration(po, pending, sku_map, wf_token, bq):
 # ==============================================================================
 # CORE PIPELINE
 # ==============================================================================
-def process_po(po, wf_token, sku_map, bq, fixed_500_set):
+def _add_line(merged, item_id, oracle_sku, wf_sku, qty, price_total):
+    m = merged.setdefault(item_id, {"oracle_sku": oracle_sku, "wayfair_skus": [],
+                                    "qty": 0, "price_total": 0.0})
+    if wf_sku not in m["wayfair_skus"]:
+        m["wayfair_skus"].append(wf_sku)
+    m["qty"]         += qty
+    m["price_total"] += price_total
+
+
+def _add_group_components(merged, group, wf_sku, qty, price):
+    """
+    Item Group (e.g. FAU-W21-BGL = FAU-W21-TRM-BGL + VLV-CAS2H-BRS) → add each
+    component as its own line. Wayfair's price for the set is split across the
+    components by Base Price, so the SO total still nets to 0.83 × Wayfair price.
+    """
+    members = group["members"]
+    retails = {m["id"]: (ns.get_item_retail_price(m["id"]) or 0.0) for m in members}
+    set_retail = sum(retails[m["id"]] * m["qty"] for m in members)
+    for m in members:
+        if set_retail > 0:
+            share = retails[m["id"]] * m["qty"] / set_retail
+        else:
+            share = 1.0 / len(members)
+        _add_line(merged, m["id"], m["itemid"], wf_sku,
+                  qty * m["qty"], price * qty * share)
+    print(f"  {wf_sku} -> {group['itemid']} (item group): "
+          + ", ".join(f"{m['itemid']}×{m['qty']}" for m in members))
+
+
+def process_po(po, wf_token, sku_map, bq, fixed_500_set, sku_map_all=None):
     po_number = po["poNumber"]
     po_date   = po.get("poDate")
 
@@ -218,6 +247,14 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
         price  = float(p.get("price") or 0)
 
         match = sku_map[sku_map["wayfair_sku"].str.upper() == wf_sku.upper()]
+        if match.empty and sku_map_all is not None:
+            # Item Groups aren't in the inventory feed, so the filtered map drops them
+            match_all = sku_map_all[sku_map_all["wayfair_sku"].str.upper() == wf_sku.upper()]
+            group = (ns.get_item_group(match_all.iloc[0]["oracle_sku"])
+                     if not match_all.empty else None)
+            if group:
+                _add_group_components(merged, group, wf_sku, qty, price)
+                continue
         if match.empty:
             unmapped.append(wf_sku)
             print(f"  Unmapped: {wf_sku}")
@@ -230,12 +267,7 @@ def process_po(po, wf_token, sku_map, bq, fixed_500_set):
             print(f"  Oracle SKU not in NS: {oracle_sku}")
             continue
 
-        m = merged.setdefault(item_id, {"oracle_sku": oracle_sku, "wayfair_skus": [],
-                                        "qty": 0, "price_total": 0.0})
-        if wf_sku not in m["wayfair_skus"]:
-            m["wayfair_skus"].append(wf_sku)
-        m["qty"]         += qty
-        m["price_total"] += price * qty
+        _add_line(merged, item_id, oracle_sku, wf_sku, qty, price * qty)
 
     for item_id, m in merged.items():
         oracle_sku = m["oracle_sku"]
@@ -351,7 +383,8 @@ def run_pipeline():
 
     raw_inv  = ns.fetch_inventory()
     wf_table = ns.build_wf_inventory_table(raw_inv)
-    sku_map  = bqlog.get_sku_map(bq).merge(
+    sku_map_all = bqlog.get_sku_map(bq)
+    sku_map  = sku_map_all.merge(
         wf_table[["oracle_sku"]], on="oracle_sku", how="inner"
     )
     print(f"SKU map: {len(sku_map)} mappings")
@@ -385,7 +418,7 @@ def run_pipeline():
         items_n   = len(po.get("products", []))
 
         try:
-            status, detail = process_po(po, wf_token, sku_map, bq, fixed_500_set)
+            status, detail = process_po(po, wf_token, sku_map, bq, fixed_500_set, sku_map_all)
             summary[status] = summary.get(status, 0) + 1
             pos_processed.append({"po": po_number, "status": status})
 
